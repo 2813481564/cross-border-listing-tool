@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>listing-desk · 采集与草稿</title>
+  <title>listing-desk · 商品库</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
@@ -20,37 +20,78 @@
         <span class="dot" id="statusDot"></span>
         <span id="statusText">检查中…</span>
       </div>
+      <button class="btn ghost" id="btnQueue">任务队列<span class="pill" id="queuePill" hidden>0</span></button>
       <button class="btn ghost" id="btnOpenChrome">打开 Chrome 登录 1688</button>
       <button class="btn ghost" id="btnSettings">设置</button>
     </div>
   </header>
 
-  <main class="layout">
-    <section class="panel input-panel">
-      <h2>采集</h2>
-      <p class="hint">每行一个 1688 商品链接，也支持直接粘贴商品 ID。</p>
-      <textarea id="urls" placeholder="https://detail.1688.com/offer/123456789.html&#10;https://detail.1688.com/offer/987654321.html"></textarea>
-      <div class="row">
-        <button class="btn primary" id="btnCollect">开始采集</button>
-        <button class="btn ghost" id="btnClear">清空</button>
-        <span class="progress" id="progress"></span>
-      </div>
+  <main class="page">
+    <!-- 列表视图 -->
+    <section class="view" id="viewList">
+      <section class="panel collect-panel">
+        <h2>采集</h2>
+        <p class="hint">每行一个 1688 商品链接，也支持直接粘贴商品 ID。提交后进后台队列，可以继续操作，不用等它跑完。</p>
+        <textarea id="urls" placeholder="https://detail.1688.com/offer/123456789.html&#10;https://detail.1688.com/offer/987654321.html"></textarea>
+        <div class="row">
+          <button class="btn primary" id="btnCollect">加入队列</button>
+          <button class="btn ghost" id="btnScanCart">采集购物车</button>
+          <button class="btn ghost" id="btnClear">清空</button>
+          <span class="progress" id="progress"></span>
+        </div>
+      </section>
 
-      <div class="divider"></div>
+      <section class="panel queue-panel" id="queuePanel" hidden>
+        <div class="panel-head">
+          <h3>任务队列 <span class="q-summary" id="queueSummary"></span></h3>
+          <div class="row">
+            <button class="btn ghost small" id="btnClearJobs">清除已完成</button>
+          </div>
+        </div>
+        <div class="queue-list" id="queueList"></div>
+      </section>
 
-      <div class="row space-between">
-        <h3>历史记录</h3>
+      <div class="list-toolbar">
+        <h2 class="list-title">商品库<span class="count" id="productCount"></span></h2>
         <div class="row">
           <button class="btn ghost small" id="btnRefresh">刷新</button>
           <button class="btn ghost small" id="btnExportCsv">导出 CSV</button>
         </div>
       </div>
-      <ul class="history" id="history"></ul>
+
+      <div class="filter-bar">
+        <input id="searchBox" type="search" placeholder="搜索标题或商品 ID" />
+        <select id="filterSelect">
+          <option value="all">全部商品</option>
+          <option value="pending">媒体未完成</option>
+          <option value="failed">有下载失败</option>
+          <option value="warned">有检查提示</option>
+        </select>
+        <select id="sortSelect">
+          <option value="new">最新采集</option>
+          <option value="price-desc">价格从高到低</option>
+          <option value="price-asc">价格从低到高</option>
+          <option value="title">标题 A-Z</option>
+        </select>
+        <label class="select-all"><input type="checkbox" id="selectAll" />全选</label>
+      </div>
+
+      <div class="batch-bar" id="batchBar" hidden>
+        <span id="batchCount">已选 0 件</span>
+        <button class="btn ghost small" id="btnBatchRecollect">批量重采</button>
+        <button class="btn ghost small" id="btnBatchExport">导出所选</button>
+        <button class="btn danger small" id="btnBatchDelete">批量删除</button>
+        <button class="btn ghost small" id="btnBatchClear">取消选择</button>
+      </div>
+
+      <div class="product-grid" id="productGrid"></div>
     </section>
 
-    <section class="panel result-panel">
-      <div class="result-head">
-        <h2 id="resultTitle">采集结果</h2>
+    <!-- 详情视图 -->
+    <section class="view" id="viewDetail" hidden>
+      <a class="back-link" href="#/products">← 返回商品列表</a>
+      <div class="detail-head">
+        <h2 id="detailTitle">商品详情</h2>
         <div class="row" id="resultActions" hidden>
           <span class="pdd-price">
             加价
@@ -64,13 +105,35 @@
           <button class="btn ghost small" id="btnCopyJson">复制草稿 JSON</button>
           <button class="btn ghost small" id="btnCopyTitle">复制标题</button>
           <button class="btn ghost small" id="btnCopyImages">复制图片链接</button>
+          <button class="btn danger small" id="btnDelete">删除商品</button>
         </div>
       </div>
-      <div id="resultBody" class="result-body">
-        <p class="empty">粘贴链接并点击「开始采集」，结果会显示在这里。</p>
-      </div>
+      <div id="resultBody" class="result-body"></div>
     </section>
   </main>
+
+  <dialog id="cartDialog">
+    <div class="dialog-body">
+      <h2>采集购物车</h2>
+      <p class="hint" id="cartSummary">——</p>
+      <div class="cart-list" id="cartList"></div>
+      <div class="row">
+        <button class="btn primary" id="btnCartConfirm">开始采集</button>
+        <button class="btn ghost" id="btnCartCancel">取消</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="confirmDialog">
+    <div class="dialog-body">
+      <h2 id="confirmTitle">确认</h2>
+      <p class="hint" id="confirmMessage">——</p>
+      <div class="row">
+        <button class="btn danger" id="btnConfirmOk">确认</button>
+        <button class="btn ghost" id="btnConfirmCancel">取消</button>
+      </div>
+    </div>
+  </dialog>
 
   <dialog id="pddDialog">
     <div class="dialog-body">

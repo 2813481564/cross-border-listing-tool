@@ -128,9 +128,18 @@ export async function listProducts() {
   const rows = database
     .prepare(
       `SELECT p.offer_id, p.title, p.title_draft, p.price_target, p.currency, p.collected_at,
+              p.warnings_json,
               (SELECT COUNT(*) FROM assets a WHERE a.offer_id = p.offer_id AND a.kind != 'video') AS media_total,
-              (SELECT COUNT(*) FROM assets a WHERE a.offer_id = p.offer_id AND a.status = 'ok') AS media_ok,
-              (SELECT COUNT(*) FROM assets a WHERE a.offer_id = p.offer_id AND a.status = 'failed') AS media_failed
+              (SELECT COUNT(*) FROM assets a
+                 WHERE a.offer_id = p.offer_id AND a.kind != 'video' AND a.status = 'ok') AS media_ok,
+              (SELECT COUNT(*) FROM assets a
+                 WHERE a.offer_id = p.offer_id AND a.kind != 'video' AND a.status = 'failed') AS media_failed,
+              (SELECT a.local_path FROM assets a
+                 WHERE a.offer_id = p.offer_id AND a.kind = 'main' AND a.local_path IS NOT NULL
+                 ORDER BY a.seq LIMIT 1) AS cover_local,
+              (SELECT a.remote_url FROM assets a
+                 WHERE a.offer_id = p.offer_id AND a.kind = 'main'
+                 ORDER BY a.seq LIMIT 1) AS cover_remote
        FROM products p
        ORDER BY p.collected_at DESC`
     )
@@ -145,8 +154,36 @@ export async function listProducts() {
     mediaTotal: r.media_total,
     mediaOk: r.media_ok,
     mediaFailed: r.media_failed,
+    warningsCount: safeJson(r.warnings_json, []).length,
+    // 列表卡片用：优先本地副本，没下载成功就回落 1688 原图
+    coverUrl: r.cover_local ? `/${String(r.cover_local).replace(/\\/g, '/')}` : r.cover_remote ?? null,
+    // 卡片封面优先用 1688 CDN 的小图，几 KB 就能画一格；失败再回落本地原图
+    thumbUrl: cdnThumbUrl(r.cover_remote, 240),
     savedAt: r.collected_at
   }));
+}
+
+/**
+ * 阿里 CDN 取缩略图的方式是「原地址后面直接追加 `_240x240.jpg`」，
+ * 不是替换扩展名——实测 `xxx-0-cib.jpg_240x240.jpg` 返回 200（26KB），
+ * 而换成 `xxx-0-cib_240x240.jpg` 是 404。只对阿里自家域名拼，别的站点一律返回 null，
+ * 前端拿不到就回落本地原图。
+ */
+function cdnThumbUrl(remoteUrl, size) {
+  if (!remoteUrl) return null;
+  const url = String(remoteUrl);
+  if (url.includes('?') || !/^https?:\/\//i.test(url)) return null;
+
+  let host;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return null;
+  }
+  if (!/(^|\.)alicdn\.com$/i.test(host)) return null;
+
+  if (/_\d+x\d+\.(jpe?g|png|webp)$/i.test(url)) return url;
+  return `${url}_${size}x${size}.jpg`;
 }
 
 export async function deleteProduct(offerId) {

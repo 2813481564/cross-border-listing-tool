@@ -103,20 +103,61 @@ SQLite 用 Node 内置的 `node:sqlite`（需要 `--experimental-sqlite`，`npm 
 
 ## 用法
 
-在文本框里每行粘一个 1688 商品链接（支持 `detail.1688.com/offer/xxx.html`、移动端链接，或直接粘贴商品 ID），点「开始采集」。
+在文本框里每行粘一个 1688 商品链接（支持 `detail.1688.com/offer/xxx.html`、移动端链接，或直接粘贴商品 ID），点「加入队列」。
 
-每条结果给出：
+**采集购物车**：点一下按钮，直接在已登录的 Chrome 里读 `cart.1688.com` 采购车，弹出预览让你勾选后再入队。
+已在商品库的商品默认不勾选——重复采集会覆盖你在详情页手改过的标题和价格。
+购物车页面类名带构建哈希（`item-group--title--F09mZrH`），抓取只认语义前缀，发版换哈希不受影响；
+抓取范围限定在购物车主体内，页面底部的「精选货源」推荐位不会被误采。
 
-- 采集到的商品信息（标题、成本价、SKU、属性、包装重量、描述）
-- **图片按类型分组**：展示主图 / 规格图（每个颜色款式各自的图）/ 详情长图
-- **讲解视频**：来自 `getLiveInfoByOfferIdWap` 接口的 mp4 地址
-- 生成的美客多草稿（西语标题、目标币种价格、变体、图片、属性映射）
+**采集在后台排队，不会锁住界面。** 提交后立刻可以继续贴下一批链接、翻商品库、开设置，
+进度在「任务队列」面板里看得见：谁在跑、卡在哪一步（采集中 / 生成草稿 / 下载图片 5/12）、
+跑了多久、谁在排队、谁失败了及失败原因。失败的任务可以直接点「重采」。
+
+队列的执行仍然是**串行**的——同一个 Chrome 页面、同一套 1688 登录态，并行只会更容易被风控拦。
+串行不等于卡死：任务在后台跑，界面照常用。队列只存在内存里，进程重启即清空；已采集的商品仍在数据库里。
+
+采集完成后，商品进入「商品库」——像购物网站那样的卡片网格，每张卡片有封面图、标题、草稿价、
+媒体完成度角标。封面走 1688 CDN 的 `_240x240.jpg` 缩略图（几十 KB），CDN 挂了才回落本地原图。
+
+商品库支持：
+
+- **搜索**：标题（西语草稿与原始中文都参与匹配）和商品 ID
+- **筛选**：全部 / 媒体未完成 / 有下载失败 / 有检查提示
+- **排序**：最新采集 / 价格升降序 / 标题
+- **批量操作**：卡片左上角勾选或「全选」，然后批量重采、导出所选 CSV、批量删除
+
+**点卡片进入详情页**（地址形如 `#/products/{offerId}`，可刷新、可后退），详情页给出：
+
+- 展示图大图（默认铺 12 张，其余点「展开」）+ 规格图 / 详情长图 / 讲解视频
+- 成本价、草稿价、重量、SKU、库存、属性，以及每个 SKU 的规格与价格
 - 检查提示（标题过长被截断、图片不足、缺重量、属性未映射等）
+- 拼多多填表、复制草稿 JSON / 标题 / 图片链接
+- **编辑草稿**：西语标题、价格、库存、类目 ID、重量可以直接改并保存回本地库。
+  只动你提交的字段，其余原样保留；标题超过上限、负价格、小数库存会被拒绝。重新采集会覆盖手改内容
+
+**删除**：卡片右上角（hover 出现）和详情页都有「删除商品」，点了会弹二次确认。
+确认后删的是这个商品的全部痕迹——数据库里的 `products` / `assets` 记录、
+`data/media/{offerId}/` 下的图片与视频副本、`data/raw/{offerId}-*.json` 采集存档、旧版 `data/results/{offerId}.json`。
+不可恢复，所以确认框会把 offerId 明写出来。
 
 草稿结构里，`pictures` 只放展示主图，`variations[].picture_url` 是该规格自己的图，
-`detail_images` 是详情长图，`videos` 是视频地址。
+`detail_images` 是详情长图，`videos` 是视频地址。商品库支持导出 CSV。
 
-支持复制草稿 JSON / 标题 / 图片链接，历史记录可导出 CSV。
+### 队列接口
+
+网页用的是这几个接口，脚本也能直接调：
+
+```bash
+POST /api/jobs          # {"urls": ["链接1", "链接2"]} → 立刻返回，后台排队
+GET  /api/jobs          # 队列快照：running / queued / active + 每个任务的状态
+POST /api/jobs/:id/retry
+POST /api/jobs/clear    # 清除已完成与已失败
+POST /api/collect       # 老的同步接口，一次请求跑完全程，留给脚本和兼容调用
+POST /api/results/:id/draft       # 手改草稿：{title, price, available_quantity, category_id, weight_g}
+POST /api/results/:id/rebuild     # 按当前配置重新生成草稿（会丢掉手改内容）
+DELETE /api/results/:id           # 删商品 + 本地文件，返回清理明细
+```
 
 ## 采集通道：API 与浏览器
 
@@ -255,6 +296,7 @@ npm run pdd-fill -- <offerId> --mode markup    # 指定加价方式
 npm run inspect                                # 抓当前标签页的表单结构，输出 data/probe/*-report.md
 node scripts/inspect-page.mjs --match goods_add --list
 node scripts/find-links.mjs 发布                # 按文字找入口，打印 href
+node scripts/probe-cart.mjs                    # 只读探测 1688 采购车结构，购物车改版后用
 node scripts/image-audit.mjs <offerId> main    # 检查本地主图像素/比例是否满足平台要求
 node scripts/open-page.mjs <url>               # 在调试浏览器里打开/聚焦页面
 ```
@@ -315,6 +357,7 @@ node --experimental-sqlite server/cli.mjs list
 ```
 server/
   index.mjs              HTTP 服务与 API
+  jobs.mjs               采集任务队列（内存态，串行执行 + 进度）
   cli.mjs                命令行入口
   config.mjs             配置与路径
   chrome.mjs             Chrome 启动与 CDP 连接
@@ -322,6 +365,7 @@ server/
   media.mjs              媒体清单构建、本地下载、补下载
   collector/
     ali1688.mjs          采集流程（含风控识别、接口拦截）
+    cart.mjs             读取 1688 采购车（采集购物车按钮）
     normalize.mjs        内嵌 JSON 的启发式解析、图片分类、视频解析
   draft/
     mercadolibre.mjs     草稿生成

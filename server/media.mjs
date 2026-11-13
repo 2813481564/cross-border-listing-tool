@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { MEDIA_DIR } from './config.mjs';
+import { MEDIA_DIR, RAW_DIR, RESULT_DIR } from './config.mjs';
 import { replaceAssets, getAssets, updateAsset } from './db.mjs';
 
 const USER_AGENT =
@@ -143,8 +143,11 @@ export async function downloadMany(assets, { concurrency = 5, onDone } = {}) {
 /**
  * 采集完成后：登记媒体清单 → 下载本地副本。
  * 图片同步下载，视频放后台，避免一次采集卡太久。
+ *
+ * options.onProgress(done, total)：图片下载进度回调，任务队列靠它显示「图片 3/8」。
  */
-export async function persistMedia(offerId, product) {
+export async function persistMedia(offerId, product, options = {}) {
+  const { onProgress } = options;
   await replaceAssets(offerId, buildAssets(product));
   const rows = await getAssets(offerId);
 
@@ -160,7 +163,15 @@ export async function persistMedia(offerId, product) {
     });
   };
 
-  await downloadMany(images, { concurrency: 5, onDone: apply });
+  let done = 0;
+  const applyImage = async (asset, result) => {
+    await apply(asset, result);
+    done += 1;
+    if (onProgress) onProgress(done, images.length);
+  };
+
+  if (onProgress) onProgress(0, images.length);
+  await downloadMany(images, { concurrency: 5, onDone: applyImage });
   if (videos.length) {
     downloadMany(videos, { concurrency: 2, onDone: apply }).catch(() => {});
   }
@@ -168,8 +179,47 @@ export async function persistMedia(offerId, product) {
   return getAssets(offerId);
 }
 
+// 商品 ID 会拼进文件路径，必须先挡掉 ../ 这类越界值
+const OFFER_ID_RE = /^[0-9A-Za-z_-]{1,64}$/;
+
+export function isValidOfferId(offerId) {
+  return OFFER_ID_RE.test(String(offerId ?? ''));
+}
+
 /** 删除某个商品的本地媒体目录 */
 export function removeMediaDir(offerId) {
+  if (!isValidOfferId(offerId)) return false;
   const dir = path.join(MEDIA_DIR, String(offerId));
-  if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  if (!fs.existsSync(dir)) return false;
+  fs.rmSync(dir, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * 彻底清掉一个商品在磁盘上的痕迹：
+ * 媒体副本目录 + 采集原始存档（{offerId}-{时间}.json）+ 旧版 JSON 结果文件。
+ */
+export function removeOfferArtifacts(offerId) {
+  const id = String(offerId);
+  const removed = { media: false, raw: 0, legacy: false };
+  if (!isValidOfferId(id)) return removed;
+
+  removed.media = removeMediaDir(id);
+
+  if (fs.existsSync(RAW_DIR)) {
+    for (const name of fs.readdirSync(RAW_DIR)) {
+      // 只认以「ID-」开头的存档，避免 ID 是另一个 ID 的前缀时误删
+      if (!name.startsWith(`${id}-`)) continue;
+      fs.rmSync(path.join(RAW_DIR, name), { force: true });
+      removed.raw += 1;
+    }
+  }
+
+  const legacy = path.join(RESULT_DIR, `${id}.json`);
+  if (fs.existsSync(legacy)) {
+    fs.rmSync(legacy, { force: true });
+    removed.legacy = true;
+  }
+
+  return removed;
 }

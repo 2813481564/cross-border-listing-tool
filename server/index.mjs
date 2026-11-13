@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { ROOT, MEDIA_DIR, CONFIG_FILE, loadConfig, writeDefaultConfig } from './config.mjs';
 import { ensureChrome, connectBrowser, getCookiesFor, openWorkPage } from './chrome.mjs';
 import { collectOffer } from './collector/index.mjs';
+import { scanCart } from './collector/cart.mjs';
 import { buildDraft, toCsv, reloadDictionary } from './draft/mercadolibre.mjs';
 import {
   openDb,
@@ -18,7 +19,13 @@ import {
   listPendingAssets,
   importLegacyResults
 } from './db.mjs';
-import { downloadMany, downloadOne, removeMediaDir, persistMedia } from './media.mjs';
+import {
+  downloadMany,
+  downloadOne,
+  removeOfferArtifacts,
+  isValidOfferId,
+  persistMedia
+} from './media.mjs';
 import { fillPddProduct, localMainImagePaths, localDetailImagePaths } from './platforms/pdd/publish.mjs';
 import {
   pushRecord,
@@ -27,6 +34,14 @@ import {
   retryFailedPushes,
   pendingCount
 } from './remote.mjs';
+import {
+  setJobHandler,
+  enqueueJob,
+  listJobs,
+  retryJob,
+  clearFinishedJobs,
+  jobStats
+} from './jobs.mjs';
 
 writeDefaultConfig();
 await openDb();
@@ -46,6 +61,108 @@ function enqueue(task) {
   return run;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 一次提交可能带多行链接，统一拆成数组 */
+function normalizeUrls(body) {
+  const raw = Array.isArray(body?.urls)
+    ? body.urls
+    : typeof body?.url === 'string'
+      ? [body.url]
+      : [];
+  return raw
+    .flatMap((s) => String(s).split(/\r?\n/))
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * 采一条链接的完整流程：取数 → 生成草稿 → 落库 → 下载媒体 → 推送线上。
+ * 同步接口和任务队列都调这里，区别只是传不传 job（传了就回写进度）。
+ */
+async function runCollect(url, body = {}, job = null) {
+  const config = loadConfig();
+
+  if (job) {
+    job.stage = '采集中';
+    job.detail = '';
+  }
+
+  const product = await collectOffer(url, {
+    mode: body.mode ?? config.collect.mode,
+    waitTimeoutMs: config.collect.waitTimeoutMs,
+    dumpRaw: config.collect.dumpRaw,
+    imagesMax: config.images.maxCount
+  });
+
+  if (job) {
+    job.offerId = product.offerId ?? null;
+    job.stage = '生成草稿';
+    job.detail = (product.title ?? '').slice(0, 60);
+  }
+
+  if (config.collect.intervalMs) {
+    if (job) job.stage = '节流等待';
+    await sleep(config.collect.intervalMs);
+  }
+
+  const built = buildDraft(product, config.mercadolibre);
+  if (product.apiFallback) {
+    built.warnings.push({
+      level: 'info',
+      field: 'collect',
+      message: product.apiFallback.message
+    });
+  }
+
+  const item = {
+    offerId: product.offerId,
+    product,
+    draft: built.draft,
+    warnings: built.warnings,
+    meta: built.meta,
+    savedAt: new Date().toISOString()
+  };
+
+  await saveProduct(item);
+
+  if (job) {
+    job.stage = '下载图片';
+    job.detail = '';
+  }
+  await persistMedia(product.offerId, product, {
+    onProgress: (done, total) => {
+      if (!job) return;
+      job.progress = { done, total };
+      job.detail = `图片 ${done}/${total}`;
+    }
+  });
+
+  // 采集端 -> 线上服务器
+  let push = null;
+  if (config.remote?.enabled) {
+    if (job) {
+      job.stage = '推送线上';
+      job.detail = '';
+    }
+    push = await pushRecord(item, config);
+    if (!push.ok) rememberFailedPush(item, push.error);
+  }
+
+  return { record: item, push };
+}
+
+// 任务队列的执行体：仍在同一条串行锁里跑，避免和拼多多填表抢同一个浏览器页面
+setJobHandler(async (job) => {
+  job.stage = '等待浏览器空闲';
+  const { record } = await enqueue(() => runCollect(job.url, job.options ?? {}, job));
+  job.offerId = record.offerId;
+  job.title = record.draft?.title || record.product?.title || '';
+  job.price = record.draft?.price ?? null;
+  job.currency = record.draft?.currency_id ?? null;
+  return { offerId: record.offerId };
+});
+
 app.get('/api/health', async (_req, res) => {
   const config = loadConfig();
   let chromeReady = false;
@@ -63,7 +180,7 @@ app.get('/api/health', async (_req, res) => {
   } catch {
     chromeReady = false;
   }
-  res.json({ chromeReady, loggedIn, config });
+  res.json({ chromeReady, loggedIn, config, queue: jobStats() });
 });
 
 app.get('/api/settings', (_req, res) => res.json(loadConfig()));
@@ -88,57 +205,49 @@ app.post('/api/chrome/open', async (req, res) => {
   }
 });
 
+/** 同步采集：老接口，一次请求跑完全程。网页已改走任务队列，这里保留给脚本和兼容调用 */
 app.post('/api/collect', async (req, res) => {
   const url = req.body?.url;
   if (!url || typeof url !== 'string') {
     return res.status(400).json({ ok: false, error: '缺少 url' });
   }
 
-  const config = loadConfig();
   try {
-    const record = await enqueue(async () => {
-      const product = await collectOffer(url, {
-        mode: req.body?.mode ?? config.collect.mode,
-        waitTimeoutMs: config.collect.waitTimeoutMs,
-        dumpRaw: config.collect.dumpRaw,
-        imagesMax: config.images.maxCount
-      });
-      if (config.collect.intervalMs) {
-        await new Promise((r) => setTimeout(r, config.collect.intervalMs));
-      }
-      const built = buildDraft(product, config.mercadolibre);
-      if (product.apiFallback) {
-        built.warnings.push({
-          level: 'info',
-          field: 'collect',
-          message: product.apiFallback.message
-        });
-      }
-      const item = {
-        offerId: product.offerId,
-        product,
-        draft: built.draft,
-        warnings: built.warnings,
-        meta: built.meta,
-        savedAt: new Date().toISOString()
-      };
-      await saveProduct(item);
-      await persistMedia(product.offerId, product);
-      return item;
-    });
-
-    // 采集端 -> 线上服务器
-    let push = null;
-    if (config.remote?.enabled) {
-      push = await pushRecord(record, config);
-      if (!push.ok) rememberFailedPush(record, push.error);
-    }
-
+    const { record, push } = await enqueue(() => runCollect(url, req.body));
     const assets = await getAssets(record.offerId);
     res.json({ ok: true, record, assets, push });
   } catch (err) {
     res.status(200).json({ ok: false, error: err.message || String(err) });
   }
+});
+
+/* ---------- 任务队列 ---------- */
+
+function jobPayload(extra = {}) {
+  return { ok: true, ...jobStats(), jobs: listJobs(), ...extra };
+}
+
+/** 提交采集任务：立刻返回，采集在后台排队跑 */
+app.post('/api/jobs', (req, res) => {
+  const urls = normalizeUrls(req.body);
+  if (!urls.length) return res.status(400).json({ ok: false, error: '缺少 url' });
+
+  const options = { mode: req.body?.mode };
+  const created = urls.map((url) => enqueueJob({ url, options }));
+  res.json(jobPayload({ created: created.map((j) => j.id) }));
+});
+
+app.get('/api/jobs', (_req, res) => res.json(jobPayload()));
+
+app.post('/api/jobs/clear', (_req, res) => {
+  clearFinishedJobs();
+  res.json(jobPayload());
+});
+
+app.post('/api/jobs/:id/retry', (req, res) => {
+  const job = retryJob(req.params.id);
+  if (!job) return res.status(404).json({ ok: false, error: '未找到该任务' });
+  res.json(jobPayload({ created: [job.id] }));
 });
 
 /* ---------- 线上服务器：接收本地推送 ---------- */
@@ -203,6 +312,28 @@ app.post('/api/pdd/fill', async (req, res) => {
   }
 });
 
+/* ---------- 采集购物车 ---------- */
+
+app.post('/api/cart/scan', async (_req, res) => {
+  try {
+    // 和采集共用串行锁：读购物车也要占那个浏览器页面
+    const scanned = await enqueue(() => scanCart());
+    const existing = new Set((await listProducts()).map((p) => p.offerId));
+    const items = scanned.items.map((item) => ({ ...item, exists: existing.has(item.offerId) }));
+
+    res.json({
+      ok: true,
+      cartUrl: scanned.cartUrl,
+      hasInvalid: scanned.hasInvalid,
+      total: items.length,
+      newCount: items.filter((i) => !i.exists).length,
+      items
+    });
+  } catch (err) {
+    res.status(200).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 app.get('/api/results', async (_req, res) => {
   res.json(await listProducts());
 });
@@ -214,9 +345,18 @@ app.get('/api/results/:offerId', async (req, res) => {
 });
 
 app.delete('/api/results/:offerId', async (req, res) => {
-  await deleteProduct(req.params.offerId);
-  removeMediaDir(req.params.offerId);
-  res.json({ ok: true });
+  const offerId = String(req.params.offerId);
+  if (!isValidOfferId(offerId)) {
+    return res.status(400).json({ ok: false, error: '商品 ID 不合法' });
+  }
+
+  const record = await getProduct(offerId);
+  if (!record) return res.status(404).json({ ok: false, error: '未找到该商品' });
+
+  // 先删库再删文件：文件删失败也只是留垃圾，不会出现「库没了文件还在被引用」
+  await deleteProduct(offerId);
+  const files = removeOfferArtifacts(offerId);
+  res.json({ ok: true, offerId, files });
 });
 
 app.post('/api/results/:offerId/rebuild', async (req, res) => {
@@ -228,6 +368,60 @@ app.post('/api/results/:offerId/rebuild', async (req, res) => {
   const updated = { ...record, draft: built.draft, warnings: built.warnings, meta: built.meta };
   await saveProduct(updated);
   res.json({ ok: true, record: updated });
+});
+
+/** 手改草稿：只动你传上来的字段，其余原样保留 */
+app.post('/api/results/:offerId/draft', async (req, res) => {
+  const offerId = String(req.params.offerId);
+  const record = await getProduct(offerId);
+  if (!record) return res.status(404).json({ ok: false, error: '未找到该商品' });
+
+  const config = loadConfig();
+  const maxTitle = config.mercadolibre?.titleMaxLength ?? 60;
+  const body = req.body ?? {};
+  const draft = { ...(record.draft ?? {}) };
+  const has = (key) => body[key] !== undefined && body[key] !== null;
+
+  if (has('title')) {
+    const title = String(body.title).trim();
+    if (!title) return res.status(400).json({ ok: false, error: '标题不能为空' });
+    if (title.length > maxTitle) {
+      return res.status(400).json({ ok: false, error: `标题超出上限 ${maxTitle} 字符（当前 ${title.length}）` });
+    }
+    draft.title = title;
+  }
+
+  if (has('price')) {
+    const price = Number(body.price);
+    if (!Number.isFinite(price) || price < 0) {
+      return res.status(400).json({ ok: false, error: '价格必须是不小于 0 的数字' });
+    }
+    draft.price = Math.round(price * 100) / 100;
+  }
+
+  if (has('available_quantity')) {
+    const qty = Number(body.available_quantity);
+    if (!Number.isInteger(qty) || qty < 0) {
+      return res.status(400).json({ ok: false, error: '库存必须是不小于 0 的整数' });
+    }
+    draft.available_quantity = qty;
+  }
+
+  if (has('category_id')) {
+    draft.category_id = String(body.category_id).trim();
+  }
+
+  if (has('weight_g')) {
+    const weight = Number(body.weight_g);
+    if (!Number.isFinite(weight) || weight < 0) {
+      return res.status(400).json({ ok: false, error: '重量必须是不小于 0 的数字' });
+    }
+    draft.package = { ...(draft.package ?? {}), weight_g: Math.round(weight) };
+  }
+
+  // savedAt 保持采集时间，列表排序才不会因为改个标题就跳到最前
+  await saveProduct({ ...record, draft, savedAt: record.savedAt });
+  res.json({ ok: true, record: await getProduct(offerId), assets: await getAssets(offerId) });
 });
 
 /* ---------- 媒体补下载 ---------- */
