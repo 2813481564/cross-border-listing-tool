@@ -1,0 +1,27 @@
+{
+  "name": "listing-desk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local listing workbench: collect product data from 1688 by URL, generate MercadoLibre draft listings.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node --experimental-sqlite server/index.mjs",
+    "chrome": "node server/cli.mjs chrome",
+    "collect": "node --experimental-sqlite server/cli.mjs collect",
+    "smoke": "node --experimental-sqlite scripts/smoke.mjs",
+    "pdd-fill": "node --experimental-sqlite server/cli.mjs pdd-fill",
+    "inspect": "node scripts/inspect-page.mjs",
+    "build": "node scripts/build-portable.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright-core": "^1.49.1"
+  },
+  "devDependencies": {
+    "docx": "^9.15.2",
+    "exceljs": "^4.4.0"
+  }
+}

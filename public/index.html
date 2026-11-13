@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>listing-desk · 采集与草稿</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">LD</span>
+      <div>
+        <h1>listing-desk</h1>
+        <p class="sub">1688 采集 → 美客多刊登草稿</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <div class="status" id="status">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">检查中…</span>
+      </div>
+      <button class="btn ghost" id="btnOpenChrome">打开 Chrome 登录 1688</button>
+      <button class="btn ghost" id="btnSettings">设置</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel input-panel">
+      <h2>采集</h2>
+      <p class="hint">每行一个 1688 商品链接，也支持直接粘贴商品 ID。</p>
+      <textarea id="urls" placeholder="https://detail.1688.com/offer/123456789.html&#10;https://detail.1688.com/offer/987654321.html"></textarea>
+      <div class="row">
+        <button class="btn primary" id="btnCollect">开始采集</button>
+        <button class="btn ghost" id="btnClear">清空</button>
+        <span class="progress" id="progress"></span>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="row space-between">
+        <h3>历史记录</h3>
+        <div class="row">
+          <button class="btn ghost small" id="btnRefresh">刷新</button>
+          <button class="btn ghost small" id="btnExportCsv">导出 CSV</button>
+        </div>
+      </div>
+      <ul class="history" id="history"></ul>
+    </section>
+
+    <section class="panel result-panel">
+      <div class="result-head">
+        <h2 id="resultTitle">采集结果</h2>
+        <div class="row" id="resultActions" hidden>
+          <span class="pdd-price">
+            加价
+            <select id="pddPriceMode" title="按倍数：成本×N；按加价：成本+N 元">
+              <option value="markup">倍数</option>
+              <option value="add">加价(元)</option>
+            </select>
+            <input id="pddPriceValue" type="number" step="0.05" min="0" value="1.35" />
+          </span>
+          <button class="btn primary small" id="btnPddFill">拼多多填表</button>
+          <button class="btn ghost small" id="btnCopyJson">复制草稿 JSON</button>
+          <button class="btn ghost small" id="btnCopyTitle">复制标题</button>
+          <button class="btn ghost small" id="btnCopyImages">复制图片链接</button>
+        </div>
+      </div>
+      <div id="resultBody" class="result-body">
+        <p class="empty">粘贴链接并点击「开始采集」，结果会显示在这里。</p>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="pddDialog">
+    <div class="dialog-body">
+      <h2>拼多多填表结果</h2>
+      <p class="hint" id="pddSummary">——</p>
+      <div id="pddReport" class="pdd-report"></div>
+      <div class="row">
+        <button class="btn primary" id="btnPddClose" value="close">知道了</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="settingsDialog">
+    <form method="dialog" class="dialog-body">
+      <h2>设置</h2>
+      <label>美客多站点
+        <select id="cfgSite">
+          <option value="MLM">MLM 墨西哥</option>
+          <option value="MLB">MLB 巴西</option>
+          <option value="MLA">MLA 阿根廷</option>
+          <option value="MLC">MLC 智利</option>
+          <option value="MCO">MCO 哥伦比亚</option>
+          <option value="MLU">MLU 乌拉圭</option>
+          <option value="MPE">MPE 秘鲁</option>
+        </select>
+      </label>
+      <div class="grid-2">
+        <label>币种<input id="cfgCurrency" type="text" /></label>
+        <label>汇率(CNY→目标)<input id="cfgRate" type="number" step="0.01" /></label>
+        <label>加价倍数<input id="cfgMarkup" type="number" step="0.05" /></label>
+        <label>价格尾数<input id="cfgEnding" type="text" placeholder=".90" /></label>
+        <label>标题上限<input id="cfgTitleMax" type="number" /></label>
+        <label>最少图片数<input id="cfgMinImages" type="number" /></label>
+      </div>
+      <div class="row">
+        <button class="btn primary" id="btnSaveSettings" value="save">保存</button>
+        <button class="btn ghost" value="cancel">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 本地运行数据：SQLite 数据库、图片副本、原始存档、Chrome 登录态
+data/
+
+# 本地配置：含 1688 appSecret / accessToken、推送 token，绝不入库
+config/settings.json
+
+# 第三方参考代码（1688 官方 python SDK，非本项目代码）
+sdk/
+采购解决方案（买家自用版）-1-python.zip
+
+# 杂项
+*.log
+.DS_Store
+Thumbs.db

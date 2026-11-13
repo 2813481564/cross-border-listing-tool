@@ -1,0 +1,55 @@
+{
+  "server": {
+    "port": 5173
+  },
+  "chrome": {
+    "debugPort": 9333,
+    "exePath": ""
+  },
+  "collect": {
+    "mode": "auto",
+    "waitTimeoutMs": 25000,
+    "intervalMs": 2500,
+    "dumpRaw": true
+  },
+  "images": {
+    "download": true,
+    "maxCount": 12
+  },
+  "mercadolibre": {
+    "site": "MLM",
+    "currency": "MXN",
+    "rate": 2.55,
+    "markup": 1.6,
+    "priceEnding": ".90",
+    "titleMaxLength": 60,
+    "minImages": 3,
+    "attributeMap": {
+      "品牌": "BRAND",
+      "型号": "MODEL",
+      "材质": "MATERIAL",
+      "颜色": "COLOR",
+      "尺码": "SIZE",
+      "风格": "STYLE",
+      "适用人群": "RECOMMENDED_AGE",
+      "产地": "ORIGIN",
+      "重量": "WEIGHT",
+      "容量": "VOLUME_CAPACITY"
+    }
+  },
+  "platforms": {
+    "ali1688": {
+      "appKey": "",
+      "appSecret": "",
+      "accessToken": "",
+      "userId": "",
+      "weightByCategory": {},
+      "defaultWeightG": 500
+    }
+  },
+  "remote": {
+    "enabled": false,
+    "baseUrl": "",
+    "token": ""
+  }
+}
