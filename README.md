@@ -38,6 +38,36 @@ npm start            # 打开 http://localhost:5173
 2. 在弹出的 Chrome 窗口里登录 1688
 3. 回到网页，左上角状态变成「Chrome 已就绪」
 
+## 登录态快照
+
+登录态本来就持久化在 `data/chrome-profile/` 里，关掉重开不用重登。但 profile 是几十个二进制文件的集合，换电脑、重装、重新解压便携包、异常退出之后它就可能失效或者干脆不存在。快照把「会话」抽成一个小 JSON，用来备份、迁移和随包分发。
+
+```bash
+npm run auth:export                      # 导出到 data/auth/1688.state.json
+npm run auth:export -- --pass 你的密码    # 加密导出（scrypt + aes-256-gcm）
+npm run auth:export -- --all             # 连其它所有域名的 cookie 一起带走
+npm run auth:import                      # 把快照套回当前浏览器
+npm run auth:probe                       # 打开购物车页实测登录是否还有效
+node --experimental-sqlite server/cli.mjs auth info   # 看快照文件信息
+```
+
+网页端在「设置 → 登录态快照」里也有这四个操作，含「下载快照」（发给同事）。
+
+**自动行为**：
+
+- 检测到已登录就顺手刷新快照，10 分钟最多写一次盘，不需要你记得备份
+- 启动时如果 profile 里没有登录态、而 `data/auth/` 里有快照，会**自动套用**；有多个同事共用一个包时也能这样工作
+- 已有加密快照时不会被明文的自动备份覆盖
+
+**打包分发**：`npm run build` 会把 `data/auth/*.json` 一起打进便携包，同事首次打开状态直接是「Chrome 已就绪」，跳过登录。
+
+**边界（重要）**：
+
+- 快照只含 cookie 与 localStorage，**不含设备指纹和 IP**。原机恢复基本必成；换机器 / 换网络能不能直接用要看 1688 的风控，可能仍会要求重新登录或过滑块
+- 默认带上 1688/淘宝、拼多多、抖店三处的登录态（同事拿到包就能直接采集 + 填表）；`--all` 才会连其它不相关的域名一起带走
+- 快照等同于账号密码，**别发群、别进 git**。要发给别人用 `--pass` 加密，密码走另一个渠道给
+- 用 `auth probe` 而不是「cookie 名存在」来判断登录是否还活着，`_m_h5_tk` 在未登录时也可能存在
+
 ## 两种运行形态
 
 **单机模式**（默认）：采集、存储、界面都在一台机器上，适合自己用。
@@ -214,8 +244,10 @@ node scripts/ali-call.mjs alibaba.product.simple.get --param productID=807019187
 
 用法：
 
-- 网页：选中一条结果，在「加价」框里选 **倍数** 或 **加价(元)** 并填数值，再点「拼多多填表」。数值会记住，下次沿用。
-- 命令行：`npm run pdd-fill -- <offerId>`，用 `--markup 1.5` 或 `--add 6` 覆盖加价。
+- 网页：选中一条结果，在「平台」下拉里选 **拼多多** 或 **抖音**，填好加价，再点统一的 **「自动填表」**。数值和平台选择都会记住，下次沿用。
+  - 选 **拼多多** 时加价区是两档金额：**拼单价 +N 元**、**单买价 +N 元**（各自加在成本价上，自动保证单买价 ≥ 拼单价 + 1，按实填不凑尾数）
+  - 选 **抖音** 时没有拼单价（抖店只有售卖价），加价区收成**一个下拉 + 一个数值框**：选 `倍率加价` 时售卖价 = 成本 × 倍数（尾数凑 .9），选 `单买加价` 时售卖价 = 成本 + 金额（按实填不凑尾数）；两种方式各记一个值，来回切换不互相覆盖
+- 命令行：`npm run pdd-fill -- <offerId>`，用 `--markup 1.5` 或 `--add 6` 覆盖加价。抖音同理 `npm run dy-fill -- <offerId> --markup 1.6` / `--add 5`。
 
 流程：
 
@@ -247,9 +279,13 @@ node scripts/ali-call.mjs alibaba.product.simple.get --param productID=807019187
 
 - 最多取 2 个维度，第三个及以后的维度会提示「未使用」
 - 规格值会去掉 `【适用大三人位】` 这类括号话术，并截到 20 字
-- 组合数超过 `maxSkus`（默认 100）时，从最后一个维度往前截断，而不是整体放弃
+- 组合数超过 `maxSkus`（默认 150）时，从最后一个维度往前截断，而不是整体放弃。
+  被砍掉的规格值在页面上就「数量不完整」，所以余量要给足（实测 130 个 SKU 平台可以接受）
+- 「提示：钢丝包单卖8元/只」这类说明文字会被识别并剔除，不占规格值名额、不生成库存 0 的无效行
 - SKU 预览图按「属性名 + 规格值」精确匹配 1688 规格图；**1688 没有配图就留空**（不拿主图充数），结果里会点名是哪几个 SKU
-- 规格值原样搬运，不删 `【】`/`()` 后缀，上限 40 字；被 SKU 上限截断时会列出丢弃的值名
+- 规格值基本原样搬运，不删 `【】`/`()` 后缀，上限 40 字；被 SKU 上限截断时会列出丢弃的值名
+- **`&` 和 `,` 会被替换成空格**：拼多多发布页不接受这两个字符（实测 `*` `+` `-` `/` `()` `.` `#` 和空格都能过），
+  不处理会导致规格值一个都加不进去、整块「规格与库存」空着
 - 库存直接沿用 1688 各 SKU 的真实库存
 - 想先看映射对不对，用 `npm run pdd-fill -- <offerId> --dry-run`，只打印不碰浏览器
 
@@ -257,10 +293,12 @@ node scripts/ali-call.mjs alibaba.product.simple.get --param productID=807019187
 
 | 字段 | 说明 |
 | --- | --- |
-| `priceMode` | 加价方式：`markup`（成本×倍数，默认）或 `add`（成本+固定金额） |
-| `markup` | 拼单价 = 成本价 × markup，默认 1.35 |
-| `addAmount` | `priceMode=add` 时的加价金额（元），默认 0 |
-| `singleRatio` | 单买价 = 成本价 × markup × singleRatio，且不低于拼单价+1 |
+| `priceMode` | 加价方式：`markup`（成本×倍数，默认，凑尾数）或 `add`（成本+金额，按实填不凑尾） |
+| `markup` | `priceMode=markup` 时：拼单价 = 成本价 × markup，默认 1.6 |
+| `groupAdd` | `priceMode=add` 时：拼单价 = 成本价 + groupAdd（元），默认 5 |
+| `singleAdd` | `priceMode=add` 时：单买价 = 成本价 + singleAdd（元），默认 8，自动保证 ≥ 拼单价+1 |
+| `addAmount` | 旧字段，`priceMode=add` 且没填 `groupAdd` 时兜底 |
+| `singleRatio` | `priceMode=markup` 时：单买价 = 拼单价 × singleRatio，且不低于拼单价+1 |
 | `refRatio` | 商品参考价 = 单买价 × refRatio，且须大于最大单买价 |
 | `priceEnding` | 价格尾数，默认 `.9` |
 | `stock` | 默认库存，默认 999 |
@@ -272,7 +310,7 @@ node scripts/ali-call.mjs alibaba.product.simple.get --param productID=807019187
 | `codePrefix` | 商品编码前缀，留空则不填 |
 | `multiSpec` | 是否自动加规格，默认 `true`；`false` 退回单规格 |
 | `maxSpecTypes` | 最多几个规格类型，默认 2（平台上限 2） |
-| `maxSkus` | SKU 组合上限，默认 100，超出按维度截断 |
+| `maxSkus` | SKU 组合上限，默认 150，超出按维度截断（截掉的规格值页面上就没有了） |
 | `useSkuPrice` | 每个 SKU 用各自 1688 价换算，默认 `false`（统一用主商品价） |
 | `previewFallbackMain` | 1688 没有规格图时是否用主图兜底，默认 **`false`**（留空，由你手动补） |
 | `uploadDetail` | 是否把详情长图传进「商品详情」，默认 `true` |
@@ -391,4 +429,5 @@ scripts/smoke.mjs        离线测试
 - 标题翻译依赖词表，词表没覆盖的部分会保留中文，需要人工补
 - 草稿的 `category_id` 需要自己填（美客多类目需要按站点查）
 - 本地副本只解决"图源失效"问题；美客多要求公网可访问，刊登前仍需把本地文件传到图床
-- 视频只下载原片，美客多刊登需走它自己的视频上传接口
+- 视频只下载原片，美客多刊登需走它自己的视频上传接口。视频有两个来源：讲解视频走 `getLiveInfoByOfferIdWap` 接口，
+  主图视频不在任何接口里，只能从页面 `<video>` 取（`domVideos`）；商品没有讲解视频时接口返回 `data:{}`，属正常

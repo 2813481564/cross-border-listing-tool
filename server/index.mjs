@@ -4,6 +4,15 @@ import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { ROOT, MEDIA_DIR, CONFIG_FILE, loadConfig, writeDefaultConfig } from './config.mjs';
 import { ensureChrome, connectBrowser, getCookiesFor, openWorkPage } from './chrome.mjs';
+import {
+  SNAPSHOT_FILE,
+  snapshotInfo,
+  exportSnapshot,
+  importSnapshot,
+  maybeRestore,
+  probeLogin,
+  backupIfLoggedIn
+} from './auth.mjs';
 import { collectOffer } from './collector/index.mjs';
 import { scanCart } from './collector/cart.mjs';
 import { buildDraft, toCsv, reloadDictionary } from './draft/mercadolibre.mjs';
@@ -16,17 +25,29 @@ import {
   getAssets,
   getAssetById,
   updateAsset,
+  deleteAssetsByIds,
+  removeImagesFromProduct,
+  deleteSkuFromProduct,
+  reorderMainAssets,
+  insertUploadedMainAssets,
   listPendingAssets,
-  importLegacyResults
+  importLegacyResults,
+  getPublishMarks,
+  setPublishMark,
+  PUBLISH_PLATFORMS
 } from './db.mjs';
 import {
   downloadMany,
   downloadOne,
+  attachImageDimensions,
+  saveUploadedMainImage,
+  removeAssetFile,
   removeOfferArtifacts,
   isValidOfferId,
   persistMedia
 } from './media.mjs';
 import { fillPddProduct, localMainImagePaths, localDetailImagePaths } from './platforms/pdd/publish.mjs';
+import { fillDouyinProduct } from './platforms/douyin/publish.mjs';
 import {
   pushRecord,
   rememberFailedPush,
@@ -49,6 +70,8 @@ const imported = await importLegacyResults();
 if (imported) console.log(`已从旧 JSON 导入 ${imported} 条记录到 SQLite`);
 
 const app = express();
+// 上传本地展示图支持较大 base64 载荷，需放在全局 2mb 限制之前
+app.use('/api/results/:offerId/assets/upload', express.json({ limit: '30mb' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(ROOT, 'public')));
 // 本地媒体副本
@@ -163,6 +186,15 @@ setJobHandler(async (job) => {
   return { offerId: record.offerId };
 });
 
+async function checkLogin() {
+  const cookies = await getCookiesFor('1688.com');
+  return cookies.some((c) => /^(cookie2|_m_h5_tk|__cn_logon_id__)$/.test(c.name) && c.value);
+}
+
+// 登录态快照的运行态：自动恢复每个进程只试一次，结果留给前端展示
+let restoreTried = false;
+let restoreResult = null;
+
 app.get('/api/health', async (_req, res) => {
   const config = loadConfig();
   let chromeReady = false;
@@ -174,13 +206,77 @@ app.get('/api/health', async (_req, res) => {
     ]);
     chromeReady = Boolean(browser);
     if (chromeReady) {
-      const cookies = await getCookiesFor('1688.com');
-      loggedIn = cookies.some((c) => /^(cookie2|_m_h5_tk|__cn_logon_id__)$/.test(c.name) && c.value);
+      loggedIn = await checkLogin();
+
+      // 新 profile（同事刚解压便携包、或换了电脑）：套用随包附带的登录态快照
+      if (!loggedIn && !restoreTried) {
+        restoreTried = true;
+        restoreResult = await maybeRestore().catch((err) => ({
+          restored: false,
+          reason: 'ERROR',
+          message: err.message
+        }));
+        if (restoreResult.restored) loggedIn = await checkLogin();
+      }
+
+      // 已登录就顺手刷新快照（内部节流，10 分钟最多写一次）
+      if (loggedIn) backupIfLoggedIn().catch(() => {});
     }
   } catch {
     chromeReady = false;
   }
-  res.json({ chromeReady, loggedIn, config, queue: jobStats() });
+  res.json({
+    chromeReady,
+    loggedIn,
+    snapshot: snapshotInfo(),
+    restore: restoreResult,
+    config,
+    queue: jobStats()
+  });
+});
+
+/* ---------- 登录态快照 ---------- */
+
+app.get('/api/auth/snapshot', (_req, res) => {
+  res.json({ ok: true, ...snapshotInfo(), restore: restoreResult });
+});
+
+/** 备份当前 1688 会话；body.pass 非空则加密落盘 */
+app.post('/api/auth/export', async (req, res) => {
+  try {
+    const result = await exportSnapshot({ pass: String(req.body?.pass ?? '') });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(200).json({ ok: false, error: err.message });
+  }
+});
+
+/** 把 data/auth/1688.state.json 套回浏览器 */
+app.post('/api/auth/import', async (req, res) => {
+  try {
+    const result = await importSnapshot({ pass: String(req.body?.pass ?? '') });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(200).json({ ok: false, error: err.message });
+  }
+});
+
+/** 下载快照文件（发给同事 / 单独备份） */
+app.get('/api/auth/snapshot/download', (_req, res) => {
+  if (!fs.existsSync(SNAPSHOT_FILE)) {
+    return res.status(404).json({ ok: false, error: '还没有快照，请先点「备份登录态」' });
+  }
+  res.download(SNAPSHOT_FILE, path.basename(SNAPSHOT_FILE));
+});
+
+/** 真实探测：打开购物车页看是否被踢回登录页 */
+app.post('/api/auth/probe', async (_req, res) => {
+  try {
+    const result = await enqueue(() => probeLogin());
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(200).json({ ok: false, error: err.message });
+  }
 });
 
 app.get('/api/settings', (_req, res) => res.json(loadConfig()));
@@ -306,7 +402,9 @@ app.post('/api/pdd/fill', async (req, res) => {
     const report = await enqueue(() =>
       fillPddProduct({ product: record.product, images, detailImages, assets, rules })
     );
-    res.json({ ok: true, ...report });
+    // 填表成功即标记「已上架拼多多」（人工可撤销或补标）
+    const marks = await setPublishMark(offerId, 'pdd', true, 'auto');
+    res.json({ ok: true, marks, ...report });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -334,6 +432,33 @@ app.post('/api/cart/scan', async (_req, res) => {
   }
 });
 
+/* ---------- 抖店半自动填表 ---------- */
+
+app.post('/api/dy/fill', async (req, res) => {
+  const offerId = String(req.body?.offerId ?? '').trim();
+  if (!offerId) return res.status(400).json({ ok: false, error: '缺少 offerId' });
+
+  const record = await getProduct(offerId);
+  if (!record) return res.status(404).json({ ok: false, error: '未找到该商品，请先采集' });
+
+  const config = loadConfig();
+  const rules = { ...(config.platforms?.douyin?.publish ?? {}), ...(req.body?.rules ?? {}) };
+  const assets = await getAssets(offerId);
+  const images = localMainImagePaths(assets);
+  const detailImages = localDetailImagePaths(assets);
+
+  try {
+    const report = await enqueue(() =>
+      fillDouyinProduct({ product: record.product, images, detailImages, assets, rules })
+    );
+    // 填表成功即标记「已上架抖音」（人工可撤销或补标）
+    const marks = await setPublishMark(offerId, 'douyin', true, 'auto');
+    res.json({ ok: true, marks, ...report });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get('/api/results', async (_req, res) => {
   res.json(await listProducts());
 });
@@ -341,7 +466,34 @@ app.get('/api/results', async (_req, res) => {
 app.get('/api/results/:offerId', async (req, res) => {
   const record = await getProduct(req.params.offerId);
   if (!record) return res.status(404).json({ ok: false, error: '未找到结果' });
-  res.json({ ok: true, record, assets: await getAssets(req.params.offerId) });
+  res.json({
+    ok: true,
+    record,
+    marks: await getPublishMarks(req.params.offerId),
+    assets: attachImageDimensions(await getAssets(req.params.offerId))
+  });
+});
+
+/** 手动标记 / 取消「已上架某平台」 */
+app.post('/api/marks', async (req, res) => {
+  const offerId = String(req.body?.offerId ?? '').trim();
+  const platform = String(req.body?.platform ?? '').trim();
+  const marked = Boolean(req.body?.marked);
+
+  if (!offerId) return res.status(400).json({ ok: false, error: '缺少 offerId' });
+  if (!PUBLISH_PLATFORMS.includes(platform)) {
+    return res.status(400).json({ ok: false, error: `不支持的平台：${platform || '(空)'}` });
+  }
+
+  const record = await getProduct(offerId);
+  if (!record) return res.status(404).json({ ok: false, error: '未找到该商品，请先采集' });
+
+  try {
+    const marks = await setPublishMark(offerId, platform, marked, 'manual');
+    res.json({ ok: true, offerId, marks });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 app.delete('/api/results/:offerId', async (req, res) => {
@@ -379,8 +531,18 @@ app.post('/api/results/:offerId/draft', async (req, res) => {
   const config = loadConfig();
   const maxTitle = config.mercadolibre?.titleMaxLength ?? 60;
   const body = req.body ?? {};
+  const product = { ...(record.product ?? {}) };
   const draft = { ...(record.draft ?? {}) };
   const has = (key) => body[key] !== undefined && body[key] !== null;
+
+  if (has('product_title')) {
+    const productTitle = String(body.product_title).trim();
+    if (!productTitle) return res.status(400).json({ ok: false, error: '中文原标题不能为空' });
+    product.title = productTitle;
+    if (draft.source && typeof draft.source === 'object') {
+      draft.source = { ...draft.source, originalTitle: productTitle };
+    }
+  }
 
   if (has('title')) {
     const title = String(body.title).trim();
@@ -420,11 +582,129 @@ app.post('/api/results/:offerId/draft', async (req, res) => {
   }
 
   // savedAt 保持采集时间，列表排序才不会因为改个标题就跳到最前
-  await saveProduct({ ...record, draft, savedAt: record.savedAt });
-  res.json({ ok: true, record: await getProduct(offerId), assets: await getAssets(offerId) });
+  await saveProduct({ ...record, product, draft, savedAt: record.savedAt });
+  res.json({
+    ok: true,
+    record: await getProduct(offerId),
+    assets: attachImageDimensions(await getAssets(offerId))
+  });
 });
 
-/* ---------- 媒体补下载 ---------- */
+/* ---------- 媒体补下载、排序、上传与删除 ---------- */
+
+/** 统一执行媒体真删除：删库记录 -> 删磁盘文件 -> 同步商品/草稿 JSON */
+async function deleteAssetsAndFiles(offerId, kind, assetsToDelete) {
+  if (!assetsToDelete.length) {
+    return {
+      deletedIds: [],
+      filesRemoved: 0,
+      record: await getProduct(offerId),
+      assets: attachImageDimensions(await getAssets(offerId))
+    };
+  }
+  const ids = assetsToDelete.map((a) => a.id);
+  const urls = assetsToDelete.map((a) => a.remoteUrl);
+  await deleteAssetsByIds(ids);
+
+  let filesRemoved = 0;
+  for (const asset of assetsToDelete) {
+    if (removeAssetFile(asset.localPath)) filesRemoved += 1;
+  }
+
+  const record = await removeImagesFromProduct(offerId, kind, urls);
+  const assets = attachImageDimensions(await getAssets(offerId));
+  return { deletedIds: ids, filesRemoved, record, assets };
+}
+
+app.delete('/api/assets/:id', async (req, res) => {
+  const asset = await getAssetById(req.params.id);
+  if (!asset) return res.status(404).json({ ok: false, error: '未找到该媒体' });
+  if (!['main', 'detail', 'sku'].includes(asset.kind)) {
+    return res.status(400).json({ ok: false, error: '当前仅支持删除展示图、规格图与详情图' });
+  }
+
+  const result = await deleteAssetsAndFiles(asset.offerId, asset.kind, [asset]);
+  res.json({
+    ok: true,
+    deletedId: asset.id,
+    fileRemoved: result.filesRemoved > 0,
+    record: result.record,
+    assets: result.assets
+  });
+});
+
+app.delete('/api/results/:offerId/skus/:skuId', async (req, res) => {
+  const offerId = String(req.params.offerId);
+  const skuId = String(req.params.skuId);
+  const outcome = await deleteSkuFromProduct(offerId, skuId);
+  if (!outcome) return res.status(404).json({ ok: false, error: '未找到该商品' });
+  if (outcome.notFound) return res.status(404).json({ ok: false, error: '未找到该 SKU 规格' });
+
+  const result = await deleteAssetsAndFiles(offerId, 'sku', outcome.assetsToDelete);
+  res.json({
+    ok: true,
+    deletedSkuId: skuId,
+    removedAssets: result.deletedIds.length,
+    filesRemoved: result.filesRemoved,
+    record: result.record,
+    assets: result.assets
+  });
+});
+
+app.patch('/api/results/:offerId/assets/order', async (req, res) => {
+  const offerId = String(req.params.offerId);
+  const record = await getProduct(offerId);
+  if (!record) return res.status(404).json({ ok: false, error: '未找到该商品' });
+
+  const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds : [];
+  if (!orderedIds.length) return res.status(400).json({ ok: false, error: '缺少有序图片 ID 列表' });
+
+  const assets = attachImageDimensions(await reorderMainAssets(offerId, orderedIds));
+  res.json({ ok: true, record: await getProduct(offerId), assets });
+});
+
+app.post('/api/results/:offerId/assets/upload', async (req, res) => {
+  const offerId = String(req.params.offerId);
+  const record = await getProduct(offerId);
+  if (!record) return res.status(404).json({ ok: false, error: '未找到该商品' });
+
+  const files = Array.isArray(req.body?.files) ? req.body.files : [];
+  if (!files.length) return res.status(400).json({ ok: false, error: '请选择要上传的图片' });
+  if (files.length > 20) return res.status(400).json({ ok: false, error: '单次最多上传 20 张图片' });
+
+  const saved = [];
+  try {
+    for (const file of files) {
+      saved.push(saveUploadedMainImage(offerId, file));
+    }
+    const assets = attachImageDimensions(await insertUploadedMainAssets(offerId, saved));
+    res.json({ ok: true, uploaded: saved.length, record: await getProduct(offerId), assets });
+  } catch (err) {
+    for (const item of saved) removeAssetFile(item.localPath);
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/results/:offerId/assets/clean-small', async (req, res) => {
+  const offerId = String(req.params.offerId);
+  const record = await getProduct(offerId);
+  if (!record) return res.status(404).json({ ok: false, error: '未找到该商品' });
+
+  const minSide = Math.max(100, Number(req.body?.minSide ?? 480) || 480);
+  const assets = attachImageDimensions(await getAssets(offerId));
+  const smalls = assets.filter(
+    (a) => a.kind === 'main' && a.status === 'ok' && a.width && a.height && (a.width < minSide || a.height < minSide)
+  );
+
+  const result = await deleteAssetsAndFiles(offerId, 'main', smalls);
+  res.json({
+    ok: true,
+    removedCount: result.deletedIds.length,
+    filesRemoved: result.filesRemoved,
+    record: result.record,
+    assets: result.assets
+  });
+});
 
 app.post('/api/assets/:id/retry', async (req, res) => {
   const asset = await getAssetById(req.params.id);
@@ -437,13 +717,15 @@ app.post('/api/assets/:id/retry', async (req, res) => {
     status: result.status,
     error: result.error
   });
-  const refreshed = await getAssetById(asset.id);
+  const [refreshed] = attachImageDimensions([await getAssetById(asset.id)]);
   res.json({ ok: result.status === 'ok', asset: refreshed, error: result.error });
 });
 
 app.post('/api/results/:offerId/retry', async (req, res) => {
   const pending = await listPendingAssets(req.params.offerId);
-  if (!pending.length) return res.json({ ok: true, retried: 0, assets: await getAssets(req.params.offerId) });
+  if (!pending.length) {
+    return res.json({ ok: true, retried: 0, assets: attachImageDimensions(await getAssets(req.params.offerId)) });
+  }
 
   const apply = async (asset, result) => {
     await updateAsset(asset.id, {
@@ -455,7 +737,7 @@ app.post('/api/results/:offerId/retry', async (req, res) => {
   };
 
   await downloadMany(pending, { concurrency: 4, onDone: apply });
-  const assets = await getAssets(req.params.offerId);
+  const assets = attachImageDimensions(await getAssets(req.params.offerId));
   res.json({ ok: true, retried: pending.length, assets });
 });
 

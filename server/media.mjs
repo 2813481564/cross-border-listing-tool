@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { MEDIA_DIR, RAW_DIR, RESULT_DIR } from './config.mjs';
+import { DATA_DIR, MEDIA_DIR, RAW_DIR, RESULT_DIR } from './config.mjs';
 import { replaceAssets, getAssets, updateAsset } from './db.mjs';
+import { readImageInfo, sizeFromBuffer } from './image-info.mjs';
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
@@ -184,6 +185,77 @@ const OFFER_ID_RE = /^[0-9A-Za-z_-]{1,64}$/;
 
 export function isValidOfferId(offerId) {
   return OFFER_ID_RE.test(String(offerId ?? ''));
+}
+
+const dimCache = new Map();
+
+/** 为已下载的本地图片附加像素尺寸（带内存缓存，失败返回 null） */
+export function attachImageDimensions(assets) {
+  return (assets ?? []).map((asset) => {
+    if (asset.kind === 'video' || asset.status !== 'ok' || !asset.localPath) {
+      return { ...asset, width: null, height: null };
+    }
+    const key = String(asset.localPath);
+    let dims = dimCache.get(key);
+    if (!dims) {
+      const target = path.resolve(DATA_DIR, key);
+      const base = path.resolve(MEDIA_DIR);
+      if (target.startsWith(`${base}${path.sep}`)) {
+        const info = readImageInfo(target);
+        if (info) {
+          dims = { width: info.width, height: info.height };
+          if (dimCache.size > 5000) dimCache.clear();
+          dimCache.set(key, dims);
+        }
+      }
+    }
+    return { ...asset, width: dims?.width ?? null, height: dims?.height ?? null };
+  });
+}
+
+/** 删除单个本地媒体文件（严格限制在 MEDIA_DIR 内） */
+export function removeAssetFile(localPath) {
+  if (!localPath) return false;
+  dimCache.delete(String(localPath));
+  const target = path.resolve(DATA_DIR, String(localPath));
+  const base = path.resolve(MEDIA_DIR);
+  if (!target.startsWith(`${base}${path.sep}`)) return false;
+  if (!fs.existsSync(target)) return false;
+  fs.rmSync(target, { force: true });
+  return true;
+}
+
+const UPLOAD_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=\s]+)$/i;
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+/** 保存前端上传的单张展示图到本地 media 目录 */
+export function saveUploadedMainImage(offerId, { name, dataUrl }) {
+  if (!isValidOfferId(offerId)) throw new Error('商品 ID 不合法');
+  const match = UPLOAD_DATA_URL_RE.exec(String(dataUrl ?? ''));
+  if (!match) throw new Error(`${name || '图片'} 格式不支持，请上传 JPG/PNG/WebP/GIF`);
+
+  const ext = match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase();
+  const buffer = Buffer.from(match[2].replace(/\s+/g, ''), 'base64');
+  if (buffer.length < 256) throw new Error(`${name || '图片'} 内容过小，可能不是有效图片`);
+  if (buffer.length > MAX_UPLOAD_BYTES) throw new Error(`${name || '图片'} 超过 10MB 上限`);
+
+  const dir = path.join(MEDIA_DIR, String(offerId), 'main');
+  fs.mkdirSync(dir, { recursive: true });
+  const filename = `custom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
+  const fullPath = path.join(dir, filename);
+  fs.writeFileSync(fullPath, buffer);
+
+  const localPath = `media/${offerId}/main/${filename}`.replace(/\\/g, '/');
+  const size = sizeFromBuffer(buffer);
+  if (size) dimCache.set(localPath, { width: size.width, height: size.height });
+
+  return {
+    localPath,
+    remoteUrl: `local://custom/${filename}`,
+    bytes: buffer.length,
+    width: size?.width ?? null,
+    height: size?.height ?? null
+  };
 }
 
 /** 删除某个商品的本地媒体目录 */

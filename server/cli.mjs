@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { loadConfig, writeDefaultConfig } from './config.mjs';
 import { ensureChrome, openWorkPage } from './chrome.mjs';
+import { snapshotInfo, exportSnapshot, importSnapshot, probeLogin, SNAPSHOT_FILE } from './auth.mjs';
 import { collectOffer } from './collector/index.mjs';
 import { buildDraft, toCsv } from './draft/mercadolibre.mjs';
 import { openDb, saveProduct, getProduct, listProducts, importLegacyResults, dbPath } from './db.mjs';
 import { persistMedia, downloadMany } from './media.mjs';
-import { getAssets, listPendingAssets, updateAsset } from './db.mjs';
+import { getAssets, listPendingAssets, updateAsset, setPublishMark } from './db.mjs';
 import { pushRecord, rememberFailedPush, retryFailedPushes } from './remote.mjs';
+import { fillDouyinProduct } from './platforms/douyin/publish.mjs';
 import {
   fillPddProduct,
   localMainImagePaths,
@@ -36,9 +38,17 @@ function usage() {
   node --experimental-sqlite server/cli.mjs export-csv            导出全部为 CSV
   node --experimental-sqlite server/cli.mjs list                  列出已存商品
   node --experimental-sqlite server/cli.mjs pdd-fill <offerId>    在浏览器里填拼多多发布表单（不提交）
+  node --experimental-sqlite server/cli.mjs dy-fill <offerId>     在浏览器里填抖店发布表单（不发布）
+  node --experimental-sqlite server/cli.mjs auth export           导出登录态快照（可加密、可分发）
+  node --experimental-sqlite server/cli.mjs auth import           套用登录态快照
+  node --experimental-sqlite server/cli.mjs auth info             查看快照文件信息
+  node --experimental-sqlite server/cli.mjs auth probe            实际打开购物车页验证登录有效性
 
 选项:
   --json           输出 JSON
+  --file <path>    auth 命令读写哪份快照（默认 data/auth/1688.state.json）
+  --pass <pwd>     auth 导出/导入时用密码加密（scrypt + aes-256-gcm）
+  --all            auth 导出时连其它所有域名的 cookie 一起带走
   --no-media       不下载媒体
   --api            强制走 1688 开放平台接口采集
   --browser        强制走浏览器采集
@@ -47,7 +57,8 @@ function usage() {
   --use-sku-price  每个 SKU 按各自 1688 价换算
   --no-spec        不自动加规格，退回单规格
   --markup <n>     临时改加价倍数（成本 × n）
-  --add <n>        临时改固定加价（成本 + n 元）
+  --add <n>        临时改拼单价加价（拼单价 = 成本 + n 元）
+  --single-add <n> 临时改单买价加价（单买价 = 成本 + n 元）
   --mode <m>       加价方式：markup | add
 `);
 }
@@ -201,6 +212,56 @@ async function runRetryPush(offerId) {
   console.log(`\n完成 ${ok}/${targets.length}`);
 }
 
+async function runDyFill(offerId) {
+  if (!offerId) {
+    console.error('用法：cli.mjs dy-fill <offerId>');
+    process.exit(1);
+  }
+  await openDb();
+  const record = await getProduct(offerId);
+  if (!record) {
+    console.error(`未找到商品 ${offerId}，请先采集`);
+    process.exit(1);
+  }
+
+  const config = loadConfig();
+  const rules = { ...(config.platforms?.douyin?.publish ?? {}) };
+  if (flagValue('markup')) {
+    rules.priceMode = 'markup';
+    rules.markup = Number(flagValue('markup'));
+  }
+  if (flagValue('add')) {
+    const add = Number(flagValue('add'));
+    // 售卖价按「单买加价」算，SKU 行也用同一口径，所以两档金额都传
+    rules.priceMode = 'add';
+    rules.groupAdd = add;
+    rules.singleAdd = add;
+    rules.addAmount = add;
+  }
+  if (flagValue('stock')) rules.stock = Number(flagValue('stock'));
+
+  const assets = await getAssets(offerId);
+  const images = localMainImagePaths(assets);
+  const detailImages = localDetailImagePaths(assets);
+
+  process.stderr.write(`抖店填表：${offerId}，主图 ${images.length} 张、详情图 ${detailImages.length} 张\n`);
+  const report = await fillDouyinProduct({ product: record.product, images, detailImages, assets, rules });
+  await setPublishMark(offerId, 'douyin', true, 'auto');
+
+  if (flags.includes('--json')) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  console.log(`\n页面: ${report.url}`);
+  console.log(`标题: ${report.title}`);
+  if (report.prices) console.log(`价格: 售卖价 ${report.prices.sale} / 参考价 ${report.prices.ref}`);
+  console.log('\n已填:');
+  report.filled.forEach((f) => console.log(`  ✓ ${f.field}: ${f.value}`));
+  console.log('\n待人工:');
+  report.pending.forEach((p) => console.log(`  · ${p}`));
+}
+
 async function runPddFill(offerId) {
   if (!offerId) {
     console.error('用法：cli.mjs pdd-fill <offerId>');
@@ -224,7 +285,12 @@ async function runPddFill(offerId) {
   }
   if (flagValue('add')) {
     rules.priceMode = 'add';
+    rules.groupAdd = Number(flagValue('add'));
     rules.addAmount = Number(flagValue('add'));
+  }
+  if (flagValue('single-add')) {
+    rules.priceMode = 'add';
+    rules.singleAdd = Number(flagValue('single-add'));
   }
   if (flagValue('mode')) rules.priceMode = flagValue('mode');
 
@@ -262,6 +328,7 @@ async function runPddFill(offerId) {
     assets,
     rules
   });
+  await setPublishMark(offerId, 'pdd', true, 'auto');
 
   if (flags.includes('--json')) {
     console.log(JSON.stringify(report, null, 2));
@@ -325,9 +392,54 @@ async function runList() {
   }
 }
 
+async function runAuth(action) {
+  const file = flagValue('file') ?? undefined;
+  const pass = flagValue('pass') ?? '';
+
+  if (action === 'export') {
+    const r = await exportSnapshot({ file, pass, allDomains: flags.includes('--all') });
+    console.log(`已导出 ${r.cookieCount} 条 cookie${r.encrypted ? '（已加密）' : ''} → ${r.file}`);
+    console.log(`体积 ${(r.bytes / 1024).toFixed(1)} KB · 导出时间 ${r.exportedAt}`);
+    if (!r.encrypted) console.log('提示：快照等同于账号密码，别发群；要发给别人请加 --pass <密码>。');
+    return;
+  }
+
+  if (action === 'import') {
+    const r = await importSnapshot({ file, pass });
+    console.log(`已恢复 ${r.cookieCount} 条 cookie，localStorage ${r.originCount} 个域`);
+    console.log('建议再跑 auth probe 确认登录真的有效。');
+    return;
+  }
+
+  if (action === 'info') {
+    const info = snapshotInfo({ file });
+    if (!info.exists) return console.log(`还没有快照：${info.file}`);
+    console.log(`文件: ${info.file}`);
+    console.log(`体积: ${(info.bytes / 1024).toFixed(1)} KB`);
+    console.log(`加密: ${info.encrypted ? '是' : '否'}`);
+    console.log(`导出时间: ${info.exportedAt ?? '(已加密，未知)'}`);
+    console.log(`cookie 数: ${info.cookieCount ?? '(已加密，未知)'}`);
+    console.log(`写入时间: ${info.mtime}`);
+    return;
+  }
+
+  if (action === 'probe') {
+    const r = await probeLogin();
+    console.log(r.loggedIn ? '登录有效' : `登录无效${r.reason ? `：${r.reason}` : ''}`);
+    console.log(`最终地址: ${r.finalUrl}`);
+    if (!r.loggedIn) process.exitCode = 1;
+    return;
+  }
+
+  usage();
+}
+
 switch (command) {
   case 'chrome':
     await runChrome();
+    break;
+  case 'auth':
+    await runAuth(positional[0]);
     break;
   case 'collect':
     if (!positional.length) {
@@ -348,6 +460,9 @@ switch (command) {
     break;
   case 'pdd-fill':
     await runPddFill(positional[0]);
+    break;
+  case 'dy-fill':
+    await runDyFill(positional[0]);
     break;
   case 'export-csv':
     await runExportCsv();

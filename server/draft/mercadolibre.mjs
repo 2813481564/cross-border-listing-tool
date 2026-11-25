@@ -188,6 +188,15 @@ export function buildDraft(product, mlConfig) {
     });
   }
 
+  // 0 个规格通常是「页面内嵌数据没解析到」而不是商品真没规格，提示重采
+  if ((product.skus ?? []).length === 0) {
+    warnings.push({
+      level: 'warn',
+      field: 'skus',
+      message: '没解析到任何规格/SKU：可能是页面未加载完或触发风控降级，建议重新采集一次再上架'
+    });
+  }
+
   // 重量：优先用包装信息表的真实称重
   const weightG = product.package?.weightG ?? null;
   const weightAttr = (product.attributes ?? []).find((a) => /重量|毛重/.test(a.name));

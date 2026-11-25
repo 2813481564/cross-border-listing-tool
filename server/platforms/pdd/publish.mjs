@@ -11,6 +11,7 @@ import path from 'node:path';
 import { openWorkPage } from '../../chrome.mjs';
 import { ROOT } from '../../config.mjs';
 import { readImageInfo } from '../../image-info.mjs';
+import { isHintSpecValue } from '../../collector/normalize.mjs';
 
 export const PUBLISH_URL = 'https://mms.pinduoduo.com/goods/category';
 
@@ -149,19 +150,26 @@ export function fitEnding(value, ending = '.9') {
   return Number((Math.max(1, Math.floor(num)) + safe).toFixed(2));
 }
 
+/** 两位小数，不做尾数包装 */
+function round2(num) {
+  return Number(Number(num).toFixed(2));
+}
+
 /**
  * 拼多多价格方案。
  *
  * 两种加价方式：
- *  - markup：拼单价 = 成本 × markup（倍数）
- *  - add：   拼单价 = 成本 + addAmount（固定加价，单位元）
+ *  - markup：拼单价 = 成本 × markup（倍数），按 priceEnding 凑尾
+ *  - add：   拼单价 = 成本 + groupAdd、单买价 = 成本 + singleAdd（元）。
+ *            「加多少钱」要的是准数，所以这一档不凑尾数。
  *
  * 拼单价 ≤ 单买价 < 参考价，参考价需大于最大单买价。
  */
 export function planPrices(costCny, rules) {
   const mode = rules.priceMode === 'add' ? 'add' : 'markup';
   const markup = Number(rules.markup ?? 1.35);
-  const addAmount = Number(rules.addAmount ?? 0);
+  const groupAdd = Number(rules.groupAdd ?? rules.addAmount ?? 0);
+  const singleAdd = Number(rules.singleAdd ?? 0);
   const singleRatio = Number(rules.singleRatio ?? 1.2);
   const refRatio = Number(rules.refRatio ?? 1.6);
   const ending = rules.priceEnding ?? '.9';
@@ -169,14 +177,33 @@ export function planPrices(costCny, rules) {
   const cost = Number(costCny) > 0 ? Number(costCny) : null;
   if (!cost) return null;
 
-  const groupRaw = mode === 'add' ? cost + addAmount : cost * markup;
+  if (mode === 'add') {
+    const group = round2(cost + groupAdd);
+    // 单买价各自加在成本上，但至少比拼单价高 1 元，否则平台校验不过
+    const single = round2(Math.max(group + 1, cost + singleAdd));
+    const reference = round2(Math.max(single + 2, single * refRatio));
+    return {
+      cost,
+      group,
+      single,
+      reference,
+      mode,
+      groupAdd,
+      singleAdd,
+      addAmount: groupAdd,
+      markup,
+      ending: null
+    };
+  }
+
+  const groupRaw = cost * markup;
   const group = fitEnding(groupRaw, ending);
   if (!group) return null;
 
   const singleRaw = Math.max(group + 1, groupRaw * singleRatio);
   const single = fitEnding(singleRaw, ending);
   const reference = fitEnding(Math.max(single + 2, single * refRatio), ending);
-  return { cost, group, single, reference, markup, addAmount, mode, ending };
+  return { cost, group, single, reference, mode, groupAdd: 0, singleAdd: 0, addAmount: 0, markup, ending };
 }
 
 /** 拼多多标题：去噪声后按字数截断（英文按 1 字算，最多 titleMaxLength）。 */
@@ -222,14 +249,46 @@ const SPEC_TYPE_MAP = [
 export const SPEC_VALUE_MAX = 40;
 
 /**
- * 规格值清洗：只压平空白、去首尾空格，**保留【】等后缀原文**。
+ * 拼多多规格值的非法字符。
  *
- * 关键：图片 label 存的是 1688 原始值（`属性=值`），一旦改写值就匹配不上，
- * 所以除长度上限外不做任何变形。
+ * 实测（在真实发布页逐个试）：
+ *   `&` 被拒、`,` 被拒、全角 `，` 被拒（提示「请避免输入特殊字符」，值被清空）；
+ *   `*` `+` `-` `/` `(` `)` `.` `#`、`【】` 和空格都能通过。
+ * 统一换成空格，既能过校验，又不会让两个不同值清洗后撞成一个。
+ */
+const PDD_BAD_SPEC_CHARS = /[&,，、；;：:]/g;
+
+/** 把 1688 的规格值转成拼多多能接受的文本（不含长度截断） */
+export function toPddSpecValue(raw) {
+  return String(raw ?? '')
+    .replace(/&amp;/gi, '&')
+    .replace(PDD_BAD_SPEC_CHARS, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * 规格值清洗：转换非法字符 + 压平空白 + 截断到 40 字。
+ *
+ * 注意：图片 label 存的是 1688 原始值（`属性=值`），所以比对规格图时
+ * 必须用同一个函数处理两侧（见 specKey），否则对不上。
  */
 function cleanSpecValue(raw) {
-  const text = String(raw ?? '').replace(/\s+/g, ' ').trim();
+  const text = toPddSpecValue(raw);
   return text.length > SPEC_VALUE_MAX ? text.slice(0, SPEC_VALUE_MAX) : text;
+}
+
+/**
+ * 兜底清洗：只用于「写入后被页面清空」的值，再激进一点，
+ * 去掉所有非中英文/数字/安全符号的字符。正常路径由 toPddSpecValue 处理。
+ */
+export function sanitizeSpecFallback(raw) {
+  return String(raw ?? '')
+    .replace(PDD_BAD_SPEC_CHARS, ' ')
+    .replace(/[^\w\u4e00-\u9fa5\s\-./(#)*+【】]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, SPEC_VALUE_MAX);
 }
 
 /** 从 SKU 里收集规格维度（保持出现顺序）。 */
@@ -240,6 +299,8 @@ function collectSpecDims(product) {
     for (const [key, rawValue] of Object.entries(sku?.specs ?? {})) {
       const val = cleanSpecValue(rawValue);
       if (!key || !val) continue;
+      // 老数据（库里已采集的）没有经过上游过滤，这里再挡一道
+      if (isHintSpecValue(val)) continue;
       if (!index.has(key)) {
         const dim = { sourceKey: key, values: [] };
         index.set(key, dim);
@@ -370,6 +431,27 @@ export function buildSkuRows(product, plan, rules = {}) {
  * 1688 的 assets.label 形如 `颜色=40*60*32cm【免抽立体式】`，值必须原样比对，
  * 任何改写都会导致匹配失败。
  */
+export function countLowMarginRows(rows, minRatio = 1.1) {
+  let low = 0;
+  for (const row of rows ?? []) {
+    const cost = Number(row?.sku?.price ?? 0);
+    if (cost > 0 && Number(row.group) < cost * minRatio) low += 1;
+  }
+  return low;
+}
+
+/**
+ * 规格值比对键。
+ *
+ * 1688 的原始值里带连续空格（`棕色耐磨款  93厘米一根`，两个空格），
+ * 而规格维度里存的是压平空白后的值（一个空格）。两边不统一就永远匹配不上，
+ * 表现为「规格图明明下载好了，填表时却一张都没上传」。
+ */
+function specKey(value) {
+  // 必须和「能写进页面的规格值」用同一套清洗，否则规格图索引对不上
+  return cleanSpecValue(value);
+}
+
 export function skuImageMap(assets) {
   const byName = {};
   const byProp = {};
@@ -381,8 +463,8 @@ export function skuImageMap(assets) {
     for (const entry of String(asset.label).split(';')) {
       const idx = entry.indexOf('=');
       if (idx < 0) continue;
-      const prop = entry.slice(0, idx).trim();
-      const name = entry.slice(idx + 1).trim();
+      const prop = specKey(entry.slice(0, idx));
+      const name = specKey(entry.slice(idx + 1));
       if (!name) continue;
       if (!byProp[`${prop}|${name}`]) byProp[`${prop}|${name}`] = localPath;
       if (!byName[name]) byName[name] = localPath;
@@ -521,34 +603,301 @@ async function specScope(page) {
   return null;
 }
 
+const escapeRegExp = (text) => String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * 在指定属性项的下拉里选中一个值。
+ *
+ * 属性项是 beast-core-form-item：label 是属性名（「重要材质」这种带前缀的也算命中），
+ * 控件是带搜索框的 select，head input 可以边输入边过滤选项。
+ *
+ * 只在控件为空时写，已有值就原样保留并说明差异 —— 自动填不覆盖人工改过的值。
+ */
+export async function fillPropertySelect(page, labelKeywords, value) {
+  const keywords = (Array.isArray(labelKeywords) ? labelKeywords : [labelKeywords]).filter(Boolean);
+  if (!keywords.length) return { ok: false, reason: '没有配置属性名关键词' };
+
+  // 直接按 label 文本定位所属表单项，不用「先取数组下标、再 nth」——
+  // 属性区是异步渲染的，两次调用之间节点会插进来，下标会漂到别的项上。
+  const labelPattern = new RegExp(keywords.map(escapeRegExp).join('|'));
+  const labelLocator = page.locator('label').filter({ hasText: labelPattern }).first();
+  if (!(await labelLocator.count().catch(() => 0))) {
+    return { ok: false, reason: `页面上没有「${keywords[0]}」这一项` };
+  }
+
+  const fieldLabel =
+    (await labelLocator.innerText().catch(() => '')).replace(/\s+/g, ' ').trim() || keywords[0];
+  const item = labelLocator.locator('xpath=ancestor::*[@data-testid="beast-core-form-item"][1]');
+  const header = item.locator('[data-testid="beast-core-select-header"]').first();
+  // 属性控件是异步渲染的：刚进第二步时 label 已经在了、下拉还没挂上，等一下再判定
+  const headerReady = await header
+    .waitFor({ state: 'visible', timeout: 5000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!headerReady) return { ok: false, reason: `「${fieldLabel}」不是下拉选项` };
+
+  const headInput = item.locator('input[data-testid="beast-core-select-htmlInput"]').first();
+  const current = await headInput.inputValue().catch(() => '');
+  if (current) {
+    if (current === value || current.includes(String(value))) {
+      return { ok: true, skipped: true, field: fieldLabel, current };
+    }
+    return {
+      ok: false,
+      kept: true,
+      field: fieldLabel,
+      reason: `「${fieldLabel}」已填「${current}」，与 1688 的「${value}」不同，保留原值`
+    };
+  }
+
+  await header.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  await headInput.fill(String(value)).catch(() => {});
+
+  // 品牌这类下拉的选项是远程拉取的，输入后要等接口回来；固定等死容易扑空
+  const options = page.locator('[class*="cIL_item"]');
+  const exactPattern = new RegExp(`^\\s*${escapeRegExp(value)}\\s*$`);
+  let option = null;
+  for (let wait = 0; wait < 12 && !option; wait += 1) {
+    const exact = options.filter({ hasText: exactPattern }).first();
+    if (await exact.count().catch(() => 0)) {
+      option = exact;
+      break;
+    }
+    const loose = options.filter({ hasText: String(value) }).first();
+    if (await loose.count().catch(() => 0)) {
+      option = loose;
+      break;
+    }
+    await page.waitForTimeout(400);
+  }
+
+  if (!option || !(await option.count().catch(() => 0))) {
+    // 先读可选值再收起下拉，否则面板已经消失，报错里就看不到能选什么
+    const shown = await options
+      .evaluateAll((els) => els.map((el) => (el.innerText || '').replace(/\s+/g, ' ').trim()))
+      .catch(() => []);
+    await page.keyboard.press('Escape').catch(() => {});
+    // 走到这里原本就是空值：把搜索词也清掉，别让它以「未选中」的样子留在框里
+    await headInput.fill('').catch(() => {});
+    return {
+      ok: false,
+      field: fieldLabel,
+      reason: `「${fieldLabel}」下拉里没有「${value}」${
+        shown.length ? `（可选：${shown.slice(0, 8).join('、')}）` : ''
+      }`
+    };
+  }
+
+  await option.click({ timeout: 5000 });
+  await page.waitForTimeout(600);
+
+  // 回读要按 label 重新定位：下拉收起时 DOM 会重排，缓存的 input 可能已经不是这一项了
+  const after = await page
+    .evaluate((name) => {
+      const el = [...document.querySelectorAll('[data-testid="beast-core-form-item"]')].find(
+        (x) =>
+          String(x.querySelector('label')?.innerText ?? '')
+            .replace(/\s+/g, ' ')
+            .trim() === name
+      );
+      const input = el?.querySelector('input[data-testid="beast-core-select-htmlInput"]');
+      return input ? String(input.value ?? '') : '';
+    }, fieldLabel)
+    .catch(() => '');
+
+  if (!after || !after.includes(String(value))) {
+    return {
+      ok: false,
+      field: fieldLabel,
+      reason: `「${fieldLabel}」点了「${value}」，回读却是「${after || '(空)'}」`
+    };
+  }
+  return { ok: true, field: fieldLabel, current: after };
+}
+
+/** 这些属性项不是类目属性（系统项，或已由别的逻辑处理），自动匹配要跳过 */
+const SYSTEM_ATTR_LABEL =
+  /轮播图|标题|品牌|商品资质|包装标签图|讲解视频|卡密|商品规格|价格|库存|参考价|满件折扣|发货时间|运费模板|规格类型/;
+
+/** 属性名归一化：去掉必填星号、「重要」前缀、空白和冒号 */
+const normalizeAttrName = (text) =>
+  String(text ?? '')
+    .replace(/^\*+/, '')
+    .replace(/^重要/, '')
+    .replace(/[\s:：]/g, '')
+    .trim();
+
+/**
+ * 把 1688 采集到的属性按名字填到页面的类目属性上。
+ *
+ * 平台属性项里「重要材质」「重要单层厚度」这类带前缀的，去掉前缀后与 1688 属性名比对。
+ * 只处理下拉类属性：页面上已有的值一律不动，匹配不到就写进「待人工」，不猜。
+ */
+export async function fillCategoryAttributes(page, product, rules, report) {
+  const items = await page
+    .evaluate(() => {
+      const clean = (t) => String(t ?? '').replace(/\s+/g, ' ').trim();
+      return [...document.querySelectorAll('[data-testid="beast-core-form-item"]')]
+        .map((el) => {
+          const label = clean(el.querySelector('label')?.innerText);
+          const isSelect = Boolean(el.querySelector('[data-testid="beast-core-select-header"]'));
+          const input = el.querySelector('input[data-testid="beast-core-select-htmlInput"]');
+          return { label, isSelect, value: input ? String(input.value ?? '') : '' };
+        })
+        .filter((x) => x.label && x.isSelect);
+    })
+    .catch(() => []);
+
+  const attrs = product?.attributes ?? [];
+  const explicit = rules.fillAttributes && rules.fillAttributes !== false ? rules.fillAttributes : {};
+  const done = new Set();
+
+  // 1) 配置里显式写的映射优先（1688 叫法和平台不一样时用）
+  for (const [sourceName, keywords] of Object.entries(explicit)) {
+    const hit =
+      attrs.find((a) => String(a.name ?? '').trim() === sourceName) ??
+      attrs.find((a) => String(a.name ?? '').includes(sourceName));
+    if (!hit?.value) {
+      report.pending.push(`1688 没有「${sourceName}」属性，需手动选`);
+      continue;
+    }
+    const result = await fillPropertySelect(page, keywords, hit.value);
+    if (result.ok) {
+      report.filled.push({
+        field: result.field ?? sourceName,
+        value: result.skipped ? `${result.current}（原已填）` : result.current
+      });
+      done.add(result.field ?? '');
+    } else {
+      report.pending.push(`属性「${sourceName}」未自动选：${result.reason}`);
+    }
+  }
+
+  if (rules.autoCategoryAttributes === false) return;
+
+  // 2) 其余属性项按名字自动对
+  for (const item of items) {
+    if (SYSTEM_ATTR_LABEL.test(item.label)) continue;
+    const key = normalizeAttrName(item.label);
+    if (!key || done.has(item.label)) continue;
+    if (item.value) continue; // 已有值（一键复用/人工）不动
+
+    const hit =
+      attrs.find((a) => normalizeAttrName(a.name) === key) ??
+      attrs.find((a) => {
+        const name = normalizeAttrName(a.name);
+        return name && (key.includes(name) || name.includes(key));
+      });
+    if (!hit?.value) {
+      report.pending.push(`属性「${key}」1688 没采到对应值，需手动选`);
+      continue;
+    }
+
+    // 1688 多值（「抽气泵,衣挂抽气式,…」）逐个试，命中哪个算哪个
+    const candidates = String(hit.value)
+      .split(/[,，、]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    let result = null;
+    let lastReason = '';
+    for (const candidate of candidates) {
+      const r = await fillPropertySelect(page, [item.label], candidate);
+      if (r.ok) {
+        result = r;
+        break;
+      }
+      lastReason = r.reason ?? '';
+    }
+    if (result) {
+      report.filled.push({ field: item.label, value: result.current });
+      done.add(item.label);
+    } else {
+      report.pending.push(
+        `属性「${key}」没自动选：${lastReason || `1688 值为「${hit.value}」，页面无可选值`}`
+      );
+    }
+  }
+}
+
 async function addSpecValues(page, values) {
   const scope = await specScope(page);
-  if (!scope) return [];
+  if (!scope) return { added: [], rejected: [], sanitized: [] };
 
   // 规格值的输入框 placeholder 随类型变化（颜色=请输入规格名称、尺寸=自定义尺寸…），
   // 所以统一取「区域内可编辑的文本框」的最后一个
   const editable = scope.locator('input[type="text"]:not([readonly])');
   const added = [];
+  const rejected = [];
+  const sanitized = [];
+
+  /** 往当前窗口的空输入框里写一个值，返回是否真的成了规格值 */
+  const attempt = async (text) => {
+    const before = await editable.count();
+
+    // 加进去之后页面会追加一个新的空输入框；这里等到它出现再写下一个值。
+    // 原来固定等 600ms，页面慢的时候拿到的还是「上一个值」那个框，
+    // 于是被误判成「加不进去了」直接 break，后面所有值都不会再尝试。
+    let last = editable.last();
+    for (let attemptWait = 0; attemptWait < 12; attemptWait += 1) {
+      if (!(await last.count())) break;
+      if ((await last.inputValue().catch(() => 'x')) === '') break;
+      await page.waitForTimeout(250);
+      last = editable.last();
+    }
+    if (!(await last.count())) return false;
+
+    const pending = await last.inputValue().catch(() => '');
+    if (pending !== '') {
+      // 页面没追加新框：清掉残留文本继续下一个值，绝不整体放弃
+      await last.fill('').catch(() => {});
+    }
+
+    await last.click({ timeout: 5000 }).catch(() => {});
+    await last.fill(String(text)).catch(() => {});
+    await last.press('Enter').catch(() => {});
+    await page.waitForTimeout(700);
+
+    const grew = (await editable.count()) > before;
+    const current = await editable.evaluateAll((els) => els.map((el) => el.value));
+    const shown = await scope.evaluate((root, v) => root.innerText.includes(v), String(text)).catch(() => false);
+    return grew || current.includes(String(text)) || shown;
+  };
 
   for (const value of values) {
-    const last = editable.last();
-    if (!(await last.count())) break;
-    if ((await last.inputValue().catch(() => 'x')) !== '') break;
-    await last.click();
-    await last.fill(String(value));
-    await last.press('Enter');
-    await page.waitForTimeout(600);
-    const current = await editable.evaluateAll((els) => els.map((el) => el.value));
-    if (current.includes(String(value))) added.push(String(value));
+    const text = String(value);
+    if (await attempt(text)) {
+      added.push(text);
+      continue;
+    }
+
+    // 页面把值清空 = 判定为特殊字符（提示「请避免输入特殊字符」）。
+    // 清洗一版再试一次，避免一个标点就让整组规格、连带整张价格库存表都填不进去。
+    const fallback = sanitizeSpecFallback(text);
+    if (fallback && fallback !== text && (await attempt(fallback))) {
+      added.push(fallback);
+      sanitized.push({ from: text, to: fallback });
+      continue;
+    }
+    rejected.push(text);
   }
-  return added;
+  return { added, rejected, sanitized };
 }
 
 /**
  * 按「价格及库存」表头逐行填值。
+ *
+ * 三个坑：
+ *  1. SKU 多时拼多多把「表头」和「数据行」拆成两个 table，表头那个 tbody 是空的，
+ *     所以要挑「行数最多」的 table 当数据表。
+ *  2. 数据表是**虚拟滚动**：DOM 里只保留十几行，滚动时才复用节点渲染新行。
+ *     因此不能「一次取全部 tr 填完」——96 个 SKU 会只填到 18 个就收工，
+ *     页面随即报「请输入第19行规格的库存」。必须边滚边填。
+ *  3. 虚拟滚动会复用节点，行序号不再可靠，只能按「规格值文字」认行。
+ *
  * 规格列数会因 rowspan 合并而不同，所以按「输入框顺序 = 数值列顺序」映射。
  */
-async function fillSkuRows(page, rows, { previewPath } = {}) {
+export async function fillSkuRows(page, rows, { previewPath } = {}) {
   const headerTable = page.locator('table').filter({ hasText: '拼单价' }).first();
   await headerTable.waitFor({ state: 'visible', timeout: 20000 });
 
@@ -556,70 +905,344 @@ async function fillSkuRows(page, rows, { previewPath } = {}) {
     h.replace(/\s+/g, '')
   );
   const cols = headers.filter((h) => /库存|拼单价|单买价|规格编码|商品编码/.test(h));
-
-  // 坑：SKU 多时拼多多把「表头」和「数据行」拆成两个 table，
-  // 表头那个 tbody 是空的，所以必须挑“行数最多”的 table 来填。
-  const tables = page.locator('table');
-  const tableCount = await tables.count();
-  let trs = null;
-  let total = 0;
-  for (let i = 0; i < tableCount; i += 1) {
-    const candidate = tables.nth(i).locator('tbody tr');
-    const n = await candidate.count();
-    if (n > total) {
-      total = n;
-      trs = candidate;
-    }
-  }
-  if (!trs || total === 0) {
-    trs = headerTable.locator('tbody tr');
-    total = await trs.count();
+  if (!cols.length) {
+    return { cols, results: [{ ok: false, reason: '没识别到价格表头' }], total: 0, filled: 0, verified: 0 };
   }
 
-  const limit = Math.min(total, rows.length);
+  const pickedValue = (row, label) =>
+    label.includes('库存')
+      ? row.stock
+      : label.includes('拼单价')
+        ? row.group
+        : label.includes('单买价')
+          ? row.single
+          : label.includes('规格编码')
+            ? row.specCode
+            : row.goodsCode;
+
+  const scrollByStep = (toTop = false) =>
+    page.evaluate((top) => {
+      let best = null;
+      let bestN = 0;
+      Array.from(document.querySelectorAll('table')).forEach((t) => {
+        const n = t.querySelectorAll('tbody tr').length;
+        if (n > bestN) {
+          bestN = n;
+          best = t;
+        }
+      });
+      if (!best) return { moved: 0, atEnd: true };
+      let node = best.parentElement;
+      while (node) {
+        const s = getComputedStyle(node);
+        if (node.scrollHeight > node.clientHeight + 20 && /auto|scroll/.test(s.overflowY)) break;
+        node = node.parentElement;
+      }
+      const scroller = node ?? document.scrollingElement;
+      const before = scroller.scrollTop;
+      const step = Math.round((scroller.clientHeight || 800) * 0.8);
+      scroller.scrollTop = top ? 0 : before + step;
+      return {
+        moved: scroller.scrollTop - before,
+        atEnd: scroller.scrollTop + (scroller.clientHeight || 0) >= scroller.scrollHeight - 4
+      };
+    }, toTop);
+
+  const bodyIdx = await page.evaluate(() => {
+    let best = -1;
+    let bestN = 0;
+    Array.from(document.querySelectorAll('table')).forEach((t, i) => {
+      const n = t.querySelectorAll('tbody tr').length;
+      if (n > bestN) {
+        bestN = n;
+        best = i;
+      }
+    });
+    return best;
+  });
+  if (bodyIdx < 0) {
+    return { cols, results: [{ ok: false, reason: '没找到 SKU 数据行' }], total: rows.length, filled: 0, verified: 0 };
+  }
+
+  const trs = page.locator('table').nth(bodyIdx).locator('tbody tr');
+
+  const norm = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
+
+  // 规格列 = 表头里第一个数值列之前的所有列。行身份就按这些列的文字认。
+  //
+  // 规格列不能按 rowspan 猜：拼多多有两种表。
+  //   有的商品颜色列 rowspan 合并（组首行有颜色、其余行只有尺寸）；
+  //   有的商品每行都把颜色和尺码都写出来（实测 773341746067 就是这种，7 行 rowspan 全是 1）。
+  // 只认 rowspan>1 会把「颜色」当成「尺寸」，key 全部错位，一行都写不进去。
+  const firstValueCol = headers.findIndex((h) => /库存|拼单价|单买价|预览图|编码|状态/.test(h));
+  const specNames = (firstValueCol > 0 ? headers.slice(0, firstValueCol) : []).map((h) =>
+    h.replace(/^\*+/, '')
+  );
+  const dimNames = Object.keys(rows[0]?.specs ?? {});
+  const byName =
+    specNames.length === dimNames.length && dimNames.every((d) => specNames.includes(d));
+  const SPEC_SEP = '\u0001';
+  const specKeyOf = (specsObj) =>
+    (byName
+      ? specNames.map((n) => norm(specsObj?.[n]))
+      : dimNames.map((d) => norm(specsObj?.[d]))
+    ).join(SPEC_SEP);
+
+  const planByKey = new Map();
+  rows.forEach((row, i) => planByKey.set(specKeyOf(row.specs), i));
+
+  /**
+   * 页面内一次性写入当前窗口：同一帧里解析行身份 + 写值。
+   *
+   * 为什么不用 locator 逐行 fill：拼多多每写一个输入框都会触发重渲染，
+   * tr 的序号随之变化，第二次 nth(i) 可能落到别的行甚至空行上
+   * （实测 91 行里有 12 行报「输入框不足 0/4」、回读只剩 44 行）。
+   * 在页面内做完整的一遍就绕开了这个竞态。
+   */
+  const specCount = specNames.length || dimNames.length;
+
+  /**
+   * 页面内还原当前窗口每一行的规格文字。
+   *
+   * 规格格 = 第一个数值输入框之前的所有格。合并单元格时这一行可能只有后半截的格，
+   * 前面的从前一行继承（颜色 rowspan=7 的表就是这样），所以按「末位对齐」补齐。
+   */
+  const writeWindow = () =>
+    page.evaluate(
+      ({ plan, fieldCount, count, sep }) => {
+        let best = null;
+        let bestN = 0;
+        Array.from(document.querySelectorAll('table')).forEach((t) => {
+          const n = t.querySelectorAll('tbody tr').length;
+          if (n > bestN) {
+            bestN = n;
+            best = t;
+          }
+        });
+        if (!best) return [];
+        const clean = (t) => String(t ?? '').replace(/\s+/g, ' ').trim();
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        const last = new Array(count).fill('');
+        const written = [];
+
+        Array.from(best.querySelectorAll('tbody tr')).forEach((tr, index) => {
+          const cells = Array.from(tr.children);
+          if (!cells.length) return;
+          const valueStart = cells.findIndex((c) => c.querySelector('input:not([type="file"])'));
+          const end = valueStart < 0 ? cells.length : valueStart;
+          const specCells = cells.slice(0, end).map((c) => clean(c.innerText));
+          if (count > 0) {
+            const offset = Math.max(0, count - specCells.length);
+            specCells.slice(0, count).forEach((v, i) => {
+              last[offset + i] = v;
+            });
+          }
+          const key = last.join(sep);
+          const values = plan[key];
+          if (!values) return;
+
+          const inputs = Array.from(tr.querySelectorAll('input')).filter((el) => el.type !== 'file');
+          if (!inputs.length) return;
+
+          for (let c = 0; c < fieldCount && c < inputs.length; c += 1) {
+            const v = values[c];
+            if (v === undefined || v === null || v === '') continue;
+            const el = inputs[c];
+            if (String(el.value) === String(v)) continue;
+            el.focus();
+            setter.call(el, String(v));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.blur();
+          }
+          written.push({ index, key });
+        });
+        return written;
+      },
+      {
+        plan: Object.fromEntries(
+          rows.map((row) => [
+            specKeyOf(row.specs),
+            cols.map((label) => {
+              const v = pickedValue(row, label);
+              return v === undefined || v === null ? '' : String(v);
+            })
+          ])
+        ),
+        fieldCount: cols.length,
+        count: specCount,
+        sep: SPEC_SEP
+      }
+    );
+
+  /** 读当前渲染窗口：还原每行规格文字，并回读输入框当前值 */
+  const readWindow = () =>
+    page.evaluate(
+      ({ count, sep }) => {
+        let best = null;
+        let bestN = 0;
+        Array.from(document.querySelectorAll('table')).forEach((t) => {
+          const n = t.querySelectorAll('tbody tr').length;
+          if (n > bestN) {
+            bestN = n;
+            best = t;
+          }
+        });
+        if (!best) return [];
+        const clean = (t) => String(t ?? '').replace(/\s+/g, ' ').trim();
+        const last = new Array(count).fill('');
+        return Array.from(best.querySelectorAll('tbody tr')).map((tr, index) => {
+          const cells = Array.from(tr.children);
+          const inputs = Array.from(tr.querySelectorAll('input')).filter((el) => el.type !== 'file');
+          if (!cells.length) return { index, key: last.join(sep), values: [] };
+          const valueStart = cells.findIndex((c) => c.querySelector('input:not([type="file"])'));
+          const end = valueStart < 0 ? cells.length : valueStart;
+          const specCells = cells.slice(0, end).map((c) => clean(c.innerText));
+          if (count > 0) {
+            const offset = Math.max(0, count - specCells.length);
+            specCells.slice(0, count).forEach((v, i) => {
+              last[offset + i] = v;
+            });
+          }
+          return { index, key: last.join(sep), values: inputs.map((el) => String(el.value ?? '')) };
+        });
+      },
+      { count: specCount, sep: SPEC_SEP }
+    );
+
+
+
   const results = [];
+  const done = new Set();
+  // 预览图上传是 Playwright 单独做的，用独立集合记账，避免多轮清扫重复上传/重复报缺图
+  const previewDone = new Set();
+  const previewSkipped = new Set();
 
-  for (let i = 0; i < limit; i += 1) {
-    const tr = trs.nth(i);
-    const inputs = tr.locator('input:not([type="file"])');
-    const count = await inputs.count();
-    if (count < cols.length) {
-      results.push({ ok: false, reason: `第 ${i + 1} 行输入框不足（${count}/${cols.length}）` });
-      continue;
+  // 规格列数量对不上时行 key 永远匹配不到，提前说清楚，别让调用方只看到「填了 0 行」
+  if (specNames.length && specNames.length !== dimNames.length) {
+    return {
+      cols,
+      results: [
+        {
+          ok: false,
+          index: -1,
+          reason: `页面规格列（${specNames.join('/')}）与计划规格（${dimNames.join('/')}）数量不一致，无法逐行对应`
+        }
+      ],
+      total: rows.length,
+      filled: 0,
+      verified: 0,
+      failed: 1,
+      previewSkipped: 0
+    };
+  }
+
+  // 先滚回顶部：上一次操作可能把表格停在底部，从底部开始就永远填不到上半部分
+  await scrollByStep(true);
+  await page.waitForTimeout(400);
+
+
+
+  const deadline = Date.now() + 6 * 60 * 1000;
+
+  for (let sweep = 0; sweep < 3 && done.size < rows.length; sweep += 1) {
+    let guard = 0;
+    while (guard < 60 && Date.now() < deadline) {
+      guard += 1;
+      const win = await readWindow();
+      if (!win.length) break;
+
+      const written = await writeWindow();
+      for (const w of written) {
+        const idx = planByKey.get(w.key);
+        if (idx === undefined || done.has(idx)) continue;
+        results.push({ ok: true, index: idx, row: rows[idx] });
+        done.add(idx);
+      }
+
+      // 预览图只能靠 Playwright 塞本地文件（页面内写不了），失败不影响价格库存
+      if (previewPath) {
+        for (const w of written) {
+          const idx = planByKey.get(w.key);
+          if (idx === undefined || previewDone.has(idx)) continue;
+          previewDone.add(idx);
+
+          const filePath = previewPath(rows[idx]);
+          if (!filePath) continue;
+
+          const file = trs.nth(w.index).locator('input[type="file"]').first();
+          if (await file.count().catch(() => 0)) {
+            await file.setInputFiles(filePath).catch(() => {});
+            await page.waitForTimeout(250);
+          } else {
+            // 行里没有上传入口：不能静默，否则「图没上去」完全看不出来
+            previewSkipped.add(idx);
+          }
+        }
+      }
+
+      const moved = await scrollByStep();
+      // 注意：滚到底不能立刻 break——最后那一屏是新渲染出来的，还没处理。
+      // 用「这一滚没动了」作终止条件，保证底部窗口会被读一次。
+      if (!moved.moved) break;
+      await page.waitForTimeout(250);
     }
 
-    for (let c = 0; c < cols.length; c += 1) {
-      const label = cols[c];
-      const row = rows[i];
-      const value = label.includes('库存')
-        ? row.stock
-        : label.includes('拼单价')
-          ? row.group
-          : label.includes('单买价')
-            ? row.single
-            : label.includes('规格编码')
-              ? row.specCode
-              : row.goodsCode;
-      if (value === undefined || value === null || value === '') continue;
-      const input = inputs.nth(c);
-      await input.click().catch(() => {});
-      await input.fill(String(value));
-      await input.evaluate((el) => el.blur());
-    }
+    if (done.size >= rows.length) break;
+    // 还有漏的：从顶部再扫一遍，虚拟滚动在窗口边界偶尔会跳过几行
+    await scrollByStep(true);
+    await page.waitForTimeout(400);
+  }
 
-    const file = tr.locator('input[type="file"]').first();
-    if (previewPath && (await file.count())) {
-      const filePath = previewPath(rows[i]);
-      if (filePath) {
-        await file.setInputFiles(filePath).catch(() => {});
-        await page.waitForTimeout(600);
+  // 回读校验：虚拟滚动下「填了但没落进表单」是真实风险，必须数一遍
+  let verified = 0;
+  try {
+    const seen = new Set();
+    for (let sweep = 0; sweep < 3 && seen.size < rows.length; sweep += 1) {
+      await scrollByStep(true);
+      await page.waitForTimeout(300);
+      for (let pass = 0; pass < 60; pass += 1) {
+        const win = await readWindow();
+        if (!win.length) break;
+        for (const r of win) {
+          const idx = planByKey.get(r.key);
+          if (idx === undefined || seen.has(idx)) continue;
+          seen.add(idx);
+          const vals = r.values;
+          const complete = cols.every((label, c) => {
+            const need = pickedValue(rows[idx], label);
+            if (need === undefined || need === null || need === '') return true;
+            return String(vals[c] ?? '') !== '';
+          });
+          if (complete) verified += 1;
+        }
+        const moved = await scrollByStep();
+        if (!moved.moved) break;
+        await page.waitForTimeout(200);
       }
     }
-
-    results.push({ ok: true, row: rows[i] });
+  } catch {
+    /* 校验失败不影响已填内容，只在报告里体现 */
   }
 
-  return { cols, results, total, filled: limit };
+  if (!done.size) {
+    results.push({
+      ok: false,
+      index: -1,
+      reason: `「价格及库存」一行都没对上：页面规格列（${specNames.join('/') || '未识别'}）、计划规格（${dimNames.join('/')}）、表头（${cols.join('/')}）`
+    });
+  }
+
+  const failed = results.filter((r) => !r.ok);
+  return {
+    cols,
+    results,
+    total: rows.length,
+    filled: done.size,
+    verified,
+    failed: failed.length,
+    previewSkipped: previewSkipped.size
+  };
 }
 
 /**
@@ -680,11 +1303,27 @@ export async function fillPddProduct({ product, images, detailImages = [], asset
       filled.push({ field: '商品属性', value: '一键复用平台匹配属性' });
       pending.push('属性值来自平台相似品匹配，请核对工艺/面料/图案等是否属实');
     } else {
-      pending.push('未找到「一键复用」，属性需手动选择');
+      pending.push('未找到「一键复用」，属性改为按名称自动填（对不上的需手动）');
     }
   } else {
     pending.push('商品属性未自动填（按配置跳过）');
   }
+
+  // 品牌：1688 的品牌不在平台品牌库里，而「品牌」是必选项，统一选「无品牌/无注册商标」
+  const brandValue = rules.brand === false ? '' : String(rules.brand ?? '无品牌');
+  if (brandValue) {
+    const brandResult = await fillPropertySelect(page, ['品牌'], brandValue);
+    if (brandResult.ok) {
+      filled.push({ field: '品牌', value: brandResult.skipped ? `${brandResult.current}（原已填）` : brandResult.current || brandValue });
+    } else {
+      pending.push(`品牌未自动选：${brandResult.reason}`);
+    }
+  } else {
+    pending.push('品牌未自动填（配置关闭）');
+  }
+
+  // 类目属性：平台没给「一键复用」按钮，就按属性名把 1688 采到的值逐项选上
+  await fillCategoryAttributes(page, product, rules, { filled, pending });
 
   const prices = planPrices(product?.price?.min, rules);
 
@@ -708,9 +1347,22 @@ export async function fillPddProduct({ product, images, detailImages = [], asset
         specOk = false;
         break;
       }
-      const added = await addSpecValues(page, dim.values);
-      if (added.length !== dim.values.length) {
-        pending.push(`规格「${dim.pddType}」只写入 ${added.length}/${dim.values.length} 个值`);
+      const { added, rejected, sanitized } = await addSpecValues(page, dim.values);
+      if (sanitized.length) {
+        pending.push(
+          `规格「${dim.pddType}」有 ${sanitized.length} 个值含平台不接受的字符，已清洗后写入：` +
+            sanitized
+              .slice(0, 3)
+              .map((s) => `${s.from} → ${s.to}`)
+              .join('、')
+        );
+      }
+      // 页面上的规格值才是真相：按实际写入的值重建计划，否则「价格及库存」永远对不上行
+      const expected = dim.values.length;
+      if (added.length === expected) dim.values = added.slice();
+      if (added.length !== expected) {
+        const bad = rejected.length ? `，被页面拒绝：${rejected.slice(0, 5).join('、')}` : '';
+        pending.push(`规格「${dim.pddType}」只写入 ${added.length}/${expected} 个值${bad}`);
       }
     }
     await settle(page, 1500);
@@ -740,9 +1392,10 @@ export async function fillPddProduct({ product, images, detailImages = [], asset
     const previewPath = (row) => {
       for (const [pddType, value] of Object.entries(row.specs)) {
         const dim = plan.dims.find((d) => d.pddType === pddType);
-        const exact = skuImages.byProp[`${dim?.sourceKey ?? ''}|${value}`];
+        const key = specKey(value);
+        const exact = skuImages.byProp[`${specKey(dim?.sourceKey ?? '')}|${key}`];
         if (exact) return exact;
-        if (skuImages.byName[value]) return skuImages.byName[value];
+        if (skuImages.byName[key]) return skuImages.byName[key];
       }
       missingPreview.push(Object.values(row.specs).join(' / '));
       return rules.previewFallbackMain === true ? picked[0] : null;
@@ -753,9 +1406,19 @@ export async function fillPddProduct({ product, images, detailImages = [], asset
       field: '商品规格',
       value: `${plan.dims.map((d) => `${d.pddType}(${d.values.length})`).join(' × ')} = ${skuRows.length} 个 SKU`
     });
-    filled.push({ field: '价格与库存', value: `${table.filled}/${table.total} 行` });
+    filled.push({ field: '价格与库存', value: `${table.filled}/${table.total} 行（回读确认 ${table.verified} 行）` });
+    if (table.verified < table.filled) {
+      pending.push(`有 ${table.filled - table.verified} 行写入后回读为空，请在「价格及库存」里抽查`);
+    }
+    if (table.previewSkipped) {
+      pending.push(`有 ${table.previewSkipped} 行没找到「预览图」上传入口（页面结构可能变了），需手动补图`);
+    }
     table.results.filter((r) => !r.ok).forEach((r) => pending.push(r.reason));
     if (rules.useSkuPrice) pending.push('SKU 价格按各自 1688 价换算，请抽查');
+    const lowRows = countLowMarginRows(skuRows);
+    if (lowRows > 0) {
+      pending.push(`有 ${lowRows} 行售价低于该规格成本的 1.1 倍，可能是加价倍数偏小，提交前务必核对`);
+    }
     if (missingPreview.length) {
       const sample = missingPreview.slice(0, 5).join('、');
       const more = missingPreview.length > 5 ? ` 等 ${missingPreview.length} 个` : '';
@@ -792,7 +1455,9 @@ export async function fillPddProduct({ product, images, detailImages = [], asset
   if (prices) {
     const singles = skuRows.map((r) => Number(r.single) || 0);
     const maxSingle = singles.length ? Math.max(...singles) : Number(prices.single) || 0;
-    const bump = fitEnding(Math.max(maxSingle + 2, maxSingle * Number(rules.refRatio ?? 1.6)), rules.priceEnding);
+    const refBase = Math.max(maxSingle + 2, maxSingle * Number(rules.refRatio ?? 1.6));
+    // 按金额加价时不凑尾数，跟 SKU 行保持同一套口径
+    const bump = (rules.priceMode ?? 'markup') === 'add' ? round2(refBase) : fitEnding(refBase, rules.priceEnding);
     const reference = Math.max(Number(prices.reference) || 0, Number(bump) || 0);
 
     const refInput = page.locator('input[placeholder*="应大于商品最大单买价"]').first();
@@ -836,7 +1501,7 @@ export async function fillPddProduct({ product, images, detailImages = [], asset
     pending.push('商品详情未上传（没有采集到详情长图），需手动或用「装修商详」');
   }
 
-  pending.push('品牌、商品资质、包装标签图需手动');
+  pending.push('商品资质、包装标签图需手动');
   pending.push('运费模板/发货时效请核对后再提交');
   pending.push('提交动作未自动化，请检查后自己点「提交并上架」');
 

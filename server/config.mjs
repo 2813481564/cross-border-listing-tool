@@ -8,12 +8,14 @@ export const IMAGE_DIR = path.join(DATA_DIR, 'images');
 export const RAW_DIR = path.join(DATA_DIR, 'raw');
 export const RESULT_DIR = path.join(DATA_DIR, 'results');
 export const PROFILE_DIR = path.join(DATA_DIR, 'chrome-profile');
+// 登录态快照（可从 profile 导出/恢复，随包分发用）
+export const AUTH_DIR = path.join(DATA_DIR, 'auth');
 // 图片与视频的本地副本
 export const MEDIA_DIR = path.join(DATA_DIR, 'media');
 export const DB_FILE = path.join(DATA_DIR, 'listing.db');
 export const CONFIG_FILE = path.join(ROOT, 'config', 'settings.json');
 
-for (const dir of [DATA_DIR, IMAGE_DIR, RAW_DIR, RESULT_DIR, MEDIA_DIR, PROFILE_DIR]) {
+for (const dir of [DATA_DIR, IMAGE_DIR, RAW_DIR, RESULT_DIR, MEDIA_DIR, PROFILE_DIR, AUTH_DIR]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
@@ -74,6 +76,32 @@ const DEFAULTS = {
     token: ''
   },
   platforms: {
+    // 抖店（fxg.jinritemai.com）半自动填表
+    douyin: {
+      publish: {
+        titleMaxLength: 30, // 抖店 60 字符 ≈ 30 汉字
+        markup: 1.6,
+        refRatio: 1.4,
+        priceEnding: '.9',
+        stock: 999,
+        imageMax: 5,
+        imageMinSide: 600,
+        imageMaxBytes: 5242880,
+        detailImageMax: 20,
+        // 固定履约设置
+        deliveryTime: '48小时',
+        afterSale: '7天无理由退货',
+        freightTemplate: '包邮',
+        // 每个 SKU 用各自的 1688 价换算（多规格统一价会亏）
+        useSkuPrice: true,
+        // SKU 组合上限（抖店单商品 SKU 上限 450）
+        maxSkus: 200,
+        // 品牌：1688 的品牌不在平台品牌库里，而「品牌」是必选项，统一选「无品牌」
+        brand: '无品牌',
+        // 类目属性自动填：用 1688 属性名对页面的 attr-field-id，命中就按控件类型填
+        autoCategoryAttributes: true
+      }
+    },
     // 1688 开放平台（企业自用应用）
     ali1688: {
       appKey: '',
@@ -101,13 +129,17 @@ const DEFAULTS = {
       publish: {
         // 拼多多标题上限：30 个汉字（60 字符）
         titleMaxLength: 30,
-        // 加价方式：markup=成本×倍数，add=成本+固定金额（元）
+        // 加价方式：markup=成本×倍数，add=成本+金额（拼单价/单买价各加各的，元）
         priceMode: 'markup',
         // 拼单价 = 成本价 × markup（priceMode=markup 时生效）
-        markup: 1.35,
-        // 拼单价 = 成本价 + addAmount（priceMode=add 时生效）
+        markup: 1.6,
+        // 拼单价 = 成本价 + groupAdd（priceMode=add 时生效，按实填不凑尾数）
+        groupAdd: 5,
+        // 单买价 = 成本价 + singleAdd（priceMode=add 时生效，自动保证比拼单价高 1 元）
+        singleAdd: 8,
+        // 旧字段：priceMode=add 且没填 groupAdd 时兜底
         addAmount: 0,
-        // 单买价 = 拼单价 × singleRatio（不得低于拼单价）
+        // 单买价 = 拼单价 × singleRatio（markup 模式下生效）
         singleRatio: 1.2,
         // 商品参考价 = 单买价 × refRatio（须大于最大单买价）
         refRatio: 1.6,
@@ -129,10 +161,11 @@ const DEFAULTS = {
         multiSpec: true,
         // 最多几个规格类型（拼多多上限 2）
         maxSpecTypes: 2,
-        // SKU 组合数上限，超过就退回单规格并提示
-        maxSkus: 100,
-        // 每个 SKU 是否用各自的 1688 价换算，false 时统一用主商品价
-        useSkuPrice: false,
+        // SKU 组合数上限。超过会从最后一个规格维度往前截断，
+        // 直接被砍掉的规格值在页面上就「数量不完整」了，所以给足余量。
+        maxSkus: 150,
+        // 每个 SKU 用各自的 1688 价换算（默认开：多规格时统一用最低价会亏）
+        useSkuPrice: true,
         // 某规格在 1688 没有规格图时：true=用主图 01 兜底，false=留空等人工补
         previewFallbackMain: false,
         // 是否把采集到的详情长图传进「商品详情（快捷编辑）」
@@ -142,7 +175,16 @@ const DEFAULTS = {
         // 商品编码前缀，留空则不填
         codePrefix: '1688-',
         // 规格编码前缀，留空则不填
-        specCodePrefix: ''
+        specCodePrefix: '',
+        // 品牌：1688 的品牌不在平台品牌库里，发布页「品牌」又是必选项，
+        // 统一选「无品牌/无注册商标」；设成 false 则完全不碰品牌
+        brand: '无品牌',
+        // 类目属性自动填：用 1688 的属性名去对页面上的属性项（去掉「重要」「*」前缀后比对），
+        // 对得上的下拉就按值选。false 关闭（只保留 fillAttributes 里显式写的）
+        autoCategoryAttributes: true,
+        // 额外/覆盖映射：1688 属性名 → 页面属性项关键词（label 模糊匹配）。
+        // 用于「1688 叫法和平台叫法不一致」的情况，例如 { 压缩形式: ['产品类型'] }
+        fillAttributes: {}
       }
     }
   }

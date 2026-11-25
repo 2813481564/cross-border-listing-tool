@@ -65,18 +65,28 @@ const README_TXT = `listing-desk 使用说明
 
 一、首次使用（只做一次）
 1. 双击「启动.bat」，稍等几秒，浏览器会自动打开一个页面。
-2. 页面右上角点「打开 Chrome 登录 1688」，会弹出一个新的 Chrome 窗口。
-3. 在这个窗口里登录 1688；再开一个标签页，登录拼多多商家后台（mms.pinduoduo.com）。
+2. 看页面右上角的状态：
+   - 显示「Chrome 已就绪」= 登录态已经随包带过来了，直接看第二步；
+   - 显示「1688 未登录」= 点「打开 Chrome 登录 1688」，在弹出的窗口里登录。
+3. 登录后如有需要，再开一个标签页登录拼多多商家后台（mms.pinduoduo.com）。
 4. 登录一次就会记住，以后不用再登。这个 Chrome 窗口不要关。
+   万一系统重置、换了电脑或提示登录失效：打开右上角「设置」，在「登录态快照」
+   里点「从快照恢复」；想给别的同事也有登录态，点「下载快照」把文件发给他。
 
 二、日常使用
 1. 双击「启动.bat」，浏览器自动打开页面。
 2. 在文本框里粘贴 1688 商品链接（一行一个），点「开始采集」。
-3. 采集完成后，在右侧结果里选一条，设置「加价」，点「拼多多填表」。
-4. 工具会把标题、图片、规格、价格、详情填进拼多多，停在提交前。
-5. 你自己核对，补品牌等必填项，然后点「提交并上架」。
+3. 采集完成后，在右侧结果里选一条，设置「加价」，点「拼多多填表」或「抖音填表」。
+4. 工具会把标题、图片、规格、价格、详情填进对应平台，停在提交前。
+5. 你自己核对，补品牌等必填项，然后点「提交并上架」/「发布商品」。
 
-   工具永远不会替你点提交。
+   工具永远不会替你点提交/发布。
+
+   两个平台的区别：
+   - 拼多多：填完标题/轮播图/规格/价格/详情，属性靠「一键复用」
+   - 抖音（抖店）：需要先在浏览器窗口里登录抖店；规格走「智能填写助手」自动上传 Excel，
+     发货时间固定 48 小时、售后 7 天无理由、运费模板 包邮，品牌自动选「无品牌」
+   - 抖店填表时，请不要同时在该页面手动操作，避免互相打断
 
 三、关闭
 直接关掉那个黑色的命令行窗口即可。
@@ -137,7 +147,11 @@ async function main() {
         private: true,
         type: 'module',
         engines: { node: '>=20' },
-        dependencies: { express: '^4.21.2', 'playwright-core': '^1.49.1' }
+        dependencies: {
+          exceljs: '^4.4.0',
+          express: '^4.21.2',
+          'playwright-core': '^1.49.1'
+        }
       },
       null,
       2
@@ -156,7 +170,7 @@ async function main() {
     copyDir(
       path.join(ROOT, 'node_modules'),
       path.join(OUT, 'node_modules'),
-      (name) => !['better-sqlite3', 'docx', 'exceljs', '.bin', '.cache'].includes(name)
+      (name) => !['better-sqlite3', 'docx', '.bin', '.cache'].includes(name)
     );
   }
 
@@ -164,6 +178,15 @@ async function main() {
   writeFile(path.join(OUT, '启动.bat'), BAT);
   writeFile(path.join(OUT, '使用说明.txt'), README_TXT);
   fs.mkdirSync(path.join(OUT, 'data'), { recursive: true });
+
+  // 6. 登录态快照：随包分发，同事首次启动自动套用（不含浏览器 profile 那堆二进制）
+  const authDir = path.join(ROOT, 'data', 'auth');
+  if (fs.existsSync(authDir)) {
+    copyDir(authDir, path.join(OUT, 'data', 'auth'), (name) => name.endsWith('.json'));
+    log('复制 data/auth/ 登录态快照（同事首次启动自动套用）');
+  } else {
+    log('未发现 data/auth/：包里不含登录态，同事需自己登录一次（可在设置里点「备份登录态」生成）');
+  }
 
   const total = (function size(dir) {
     let sum = 0;

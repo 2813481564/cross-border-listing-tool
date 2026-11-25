@@ -63,6 +63,11 @@
         <input id="searchBox" type="search" placeholder="搜索标题或商品 ID" />
         <select id="filterSelect">
           <option value="all">全部商品</option>
+          <option value="pdd-not">未上架拼多多</option>
+          <option value="pdd-listed">已上架拼多多</option>
+          <option value="dy-not">未上架抖音</option>
+          <option value="dy-listed">已上架抖音</option>
+          <option value="none-listed">两个平台都未上架</option>
           <option value="pending">媒体未完成</option>
           <option value="failed">有下载失败</option>
           <option value="warned">有检查提示</option>
@@ -89,19 +94,44 @@
 
     <!-- 详情视图 -->
     <section class="view" id="viewDetail" hidden>
-      <a class="back-link" href="#/products">← 返回商品列表</a>
+      <div class="detail-nav">
+        <a class="back-link" href="#/products">← 返回商品列表</a>
+        <div class="detail-pager" id="detailPager" hidden>
+          <button class="btn ghost small" id="btnPrevProduct" type="button">← 上一件</button>
+          <span class="pager-pos" id="detailPagerPos"></span>
+          <button class="btn ghost small" id="btnNextProduct" type="button">下一件 →</button>
+        </div>
+      </div>
       <div class="detail-head">
         <h2 id="detailTitle">商品详情</h2>
+        <div class="marks-bar" id="marksBar" hidden></div>
         <div class="row" id="resultActions" hidden>
           <span class="pdd-price">
-            加价
-            <select id="pddPriceMode" title="按倍数：成本×N；按加价：成本+N 元">
-              <option value="markup">倍数</option>
-              <option value="add">加价(元)</option>
+            平台
+            <select id="fillPlatform" title="选择要填表的平台">
+              <option value="pdd">拼多多</option>
+              <option value="douyin">抖音</option>
             </select>
-            <input id="pddPriceValue" type="number" step="0.05" min="0" value="1.35" />
           </span>
-          <button class="btn primary small" id="btnPddFill">拼多多填表</button>
+          <span class="pdd-price" id="fillPddGroup">
+            拼单价+
+            <input id="pddGroupAdd" type="number" step="0.1" min="0" value="5" title="拼单价 = 成本价 + 该金额（元），按实填不凑尾数" />元
+          </span>
+          <span class="pdd-price" id="fillPddSingle">
+            单买价+
+            <input id="pddSingleAdd" type="number" step="0.1" min="0" value="8" title="单买价 = 成本价 + 该金额（元），自动保证比拼单价高 1 元" />元
+          </span>
+          <span class="pdd-price" id="fillDyPrice" hidden>
+            加价方式
+            <select id="dyPriceMode" title="选「倍率加价」按成本乘倍数，选「单买加价」按成本加金额">
+              <option value="markup">倍率加价</option>
+              <option value="add">单买加价</option>
+            </select>
+            <span id="dyPriceLabel">加价倍数</span>
+            <input id="dyPriceValue" type="number" step="0.05" min="1" value="1.6" title="售卖价 = 成本价 × 该倍数，价格尾数凑 .9" />
+          </span>
+          <span class="fill-preview" id="fillPricePreview"></span>
+          <button class="btn primary small" id="btnAutoFill">自动填表</button>
           <button class="btn ghost small" id="btnCopyJson">复制草稿 JSON</button>
           <button class="btn ghost small" id="btnCopyTitle">复制标题</button>
           <button class="btn ghost small" id="btnCopyImages">复制图片链接</button>
@@ -137,12 +167,31 @@
 
   <dialog id="pddDialog">
     <div class="dialog-body">
-      <h2>拼多多填表结果</h2>
+      <h2 id="fillDialogTitle">拼多多填表结果</h2>
       <p class="hint" id="pddSummary">——</p>
       <div id="pddReport" class="pdd-report"></div>
       <div class="row">
         <button class="btn primary" id="btnPddClose" value="close">知道了</button>
       </div>
+    </div>
+  </dialog>
+
+  <dialog id="lightboxDialog" class="lightbox-dialog">
+    <div class="lightbox-body">
+      <div class="lightbox-head">
+        <span id="lightboxTitle">图片预览</span>
+        <div class="row">
+          <button class="btn ghost small" id="btnLightboxTop" type="button" hidden>设为首图</button>
+          <button class="btn danger small" id="btnLightboxDelete" type="button" hidden>删除</button>
+          <button class="btn ghost small" id="btnLightboxClose" type="button">关闭</button>
+        </div>
+      </div>
+      <div class="lightbox-stage">
+        <button class="lightbox-nav prev" id="btnLightboxPrev" type="button" title="上一张 (←)">‹</button>
+        <img id="lightboxImg" alt="预览大图" />
+        <button class="lightbox-nav next" id="btnLightboxNext" type="button" title="下一张 (→)">›</button>
+      </div>
+      <div class="lightbox-foot" id="lightboxMeta"></div>
     </div>
   </dialog>
 
@@ -167,6 +216,15 @@
         <label>价格尾数<input id="cfgEnding" type="text" placeholder=".90" /></label>
         <label>标题上限<input id="cfgTitleMax" type="number" /></label>
         <label>最少图片数<input id="cfgMinImages" type="number" /></label>
+      </div>
+      <div class="divider"></div>
+      <h2>登录态快照</h2>
+      <p class="hint" id="authSnapshotInfo">——</p>
+      <div class="row">
+        <button type="button" class="btn ghost small" id="btnAuthExport">备份登录态</button>
+        <button type="button" class="btn ghost small" id="btnAuthDownload">下载快照</button>
+        <button type="button" class="btn ghost small" id="btnAuthImport">从快照恢复</button>
+        <button type="button" class="btn ghost small" id="btnAuthProbe">检查是否有效</button>
       </div>
       <div class="row">
         <button class="btn primary" id="btnSaveSettings" value="save">保存</button>

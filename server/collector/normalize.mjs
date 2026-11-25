@@ -102,10 +102,14 @@ export function extractImages(tree) {
   return main.length >= 3 ? main : [...main, ...rest];
 }
 
+/** 推荐位/相似商品的容器，里面的标题不是本商品 */
+const RECOMMEND_PATH = /majorRecommendOfferInfos|recommend|similar|offerList|hotOffer|rankList|alsoView|guessYouLike/i;
+
 export function extractTitle(tree) {
   const candidates = [];
   for (const { node, path } of walk(tree)) {
     if (!node || typeof node !== 'object' || Array.isArray(node)) continue;
+    if (RECOMMEND_PATH.test(path)) continue;
     for (const [key, value] of Object.entries(node)) {
       if (!TITLE_KEYS.test(key)) continue;
       const s = pickString(value);
@@ -117,6 +121,37 @@ export function extractTitle(tree) {
   // 标题通常较长且包含空格/规格词，取最长的合理候选
   candidates.sort((a, b) => b.len - a.len);
   return { title: candidates[0].title, path: candidates[0].path };
+}
+
+/**
+ * 本商品标题：优先 offerId 命中且 isCurrentOffer 的那条。
+ *
+ * 只靠「最长的中文串」会踩坑——推荐位里同款商品的标题经常比本商品更长，
+ * 实测抓到的是一条完全不相干的项链标题。
+ */
+export function extractOfferTitle(tree, offerId) {
+  const targetId = String(offerId ?? '');
+  let matched = null;
+  let current = null;
+
+  for (const { node, path } of walk(tree)) {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) continue;
+    const text = typeof node.title === 'string' ? node.title.trim() : '';
+    if (!text || !looksLikeChineseTitle(text)) continue;
+
+    const id = String(node.offerId ?? node.offerID ?? '');
+    const isCurrent = node.isCurrentOffer === true;
+
+    if (targetId && id === targetId) {
+      if (isCurrent) return { title: text, path: `${path}.title` };
+      matched = matched ?? { title: text, path: `${path}.title` };
+    } else if (isCurrent && !current) {
+      // 兜底：本页标了 isCurrentOffer 的那条（不受 offerId 字符串类型影响）
+      current = { title: text, path: `${path}.title` };
+    }
+  }
+
+  return matched ?? current ?? { title: null, path: null };
 }
 
 export function extractPrice(tree) {
@@ -163,6 +198,19 @@ function isSkuItem(it) {
     it.skuId !== undefined &&
     ('specAttrs' in it || 'skuAttrs' in it || 'price' in it || 'discountPrice' in it || 'specId' in it)
   );
+}
+
+/**
+ * 1688 规格区里混着的说明文字不是规格值。
+ *
+ * 例：尺寸里多出「提示：钢丝包单卖8元/只」——它会占掉一个规格值名额、
+ * 生成一批库存 0 的无效 SKU，还会把真实尺寸挤掉。这类文本必须在上游剔掉。
+ */
+const SPEC_HINT_PATTERN =
+  /^(提示|注意|说明|备注|温馨提示)\s*[:：]|元\s*\/\s*(只|个|件|套|对|条|张)|单卖|不参与|请咨询|拍前咨询|下单前|另拍/;
+
+export function isHintSpecValue(value) {
+  return SPEC_HINT_PATTERN.test(String(value ?? ''));
 }
 
 /**
@@ -222,6 +270,9 @@ export function extractSkus(tree) {
         if (val) specs[k] = val;
       }
     }
+
+    // 带说明文字的 SKU 是配件/附注，不是主商品的可选规格，整条丢弃
+    if (Object.values(specs).some((v) => isHintSpecValue(v))) continue;
 
     skus.push({
       skuId: id,
@@ -388,7 +439,9 @@ export function normalizeProduct({ offerId, url, payload, pageText = '' }) {
   const merged = { sources: trees.map((t) => t.source), data: trees };
   const combined = { trees: trees.map((t) => t.data) };
 
-  const title = extractTitle(combined);
+  // 优先本商品那条标题，避免被推荐位更长的标题顶掉
+  const scopedTitle = extractOfferTitle(combined, offerId);
+  const title = scopedTitle.title ? scopedTitle : extractTitle(combined);
   let price = extractPrice(combined);
   const skus = extractSkus(combined);
   // 属性优先用 DOM 直出的结果（接口里没有）
@@ -423,7 +476,33 @@ export function normalizeProduct({ offerId, url, payload, pageText = '' }) {
   );
   const images = mainImages.length ? mainImages : [...skuImageSet];
 
-  const video = parseVideo(payload.videoRaw);
+  // 讲解视频来自 getLiveInfoByOfferIdWap 接口；主图视频不在接口里，只能用 DOM 里的 <video> 兜底。
+  // 接口对没有讲解视频的商品返回 data:{}，此时 videos 全看 DOM。
+  const liveVideo = parseVideo(payload.videoRaw);
+  const domVideos = (payload.domVideos ?? [])
+    .map((item) => {
+      const url = typeof item === 'string' ? item : item?.url;
+      if (!url) return null;
+      const videoId = String(url).match(/\/(\d{6,})\.(?:mp4|m3u8|flv)/i)?.[1] ?? null;
+      return {
+        url,
+        videoId,
+        type: 'main',
+        live: false,
+        poster: (typeof item === 'object' && item?.poster) || null,
+        linkUrl: null
+      };
+    })
+    .filter(Boolean);
+
+  const seenVideoUrl = new Set();
+  const videos = [liveVideo, ...domVideos].filter((item) => {
+    if (!item) return false;
+    const key = String(item.url).split('?')[0];
+    if (seenVideoUrl.has(key)) return false;
+    seenVideoUrl.add(key);
+    return true;
+  });
 
   let priceSource = price.path;
   // 接口里同时有本商品价和"同款推荐"价，优先取本商品
@@ -431,6 +510,18 @@ export function normalizeProduct({ offerId, url, payload, pageText = '' }) {
   if (primarySample) {
     price = { ...price, min: primarySample.price, max: primarySample.price, path: primarySample.path };
     priceSource = `${primarySample.path}(本商品)`;
+  }
+
+  // 促销/补贴会把「本商品价」压到低于所有 SKU 价（实测 2.21 vs 4.42），
+  // 那个价下单时拿不到，用最低 SKU 价兜住
+  const skuPrices = skus.map((s) => Number(s.price)).filter((p) => Number.isFinite(p) && p > 0);
+  if (skuPrices.length) {
+    const lo = Math.min(...skuPrices);
+    const hi = Math.max(...skuPrices);
+    if (price.min == null || price.min < lo * 0.95) {
+      price = { ...price, min: lo, max: hi };
+      priceSource = `${priceSource}(低于最低SKU价，已按SKU价修正)`;
+    }
   }
   if (price.min === null) {
     const fromText = extractPriceFromBodyText(pageText);
@@ -464,7 +555,7 @@ export function normalizeProduct({ offerId, url, payload, pageText = '' }) {
     skus,
     attributes,
     package: { weightG, table: pack ?? null },
-    videos: video ? [video] : [],
+    videos,
     description: description.text,
     // 店铺主页（从页面店铺链接取，取不到为 null）
     shop: payload.domShop

@@ -91,6 +91,42 @@ async function grabPagePayload(page) {
       }
     }
 
+    // 新版详情页（OD 框架）把数据模型挂在 window.context 上，上面那张名字表里没有它，
+    // 结果标题、规格、SKU 整段丢失。
+    //
+    // 挂载点随版本变化（实测是 context.result.data.Root.fields.dataJson），
+    // 所以按「谁身上有 fields.dataJson」做广度搜索，别猜固定路径。
+    try {
+      const ctx = window.context;
+      if (ctx && typeof ctx === 'object') {
+        const queue = [{ node: ctx, depth: 0 }];
+        const seen = new WeakSet();
+        let dataJson = null;
+        let steps = 0;
+        while (queue.length && steps < 3000) {
+          const cur = queue.shift();
+          steps += 1;
+          const node = cur.node;
+          if (!node || typeof node !== 'object' || seen.has(node)) continue;
+          seen.add(node);
+          if (node.fields && node.fields.dataJson && typeof node.fields.dataJson === 'object') {
+            dataJson = node.fields.dataJson;
+            break;
+          }
+          if (cur.depth >= 8) continue;
+          for (const key of Object.keys(node)) {
+            const child = node[key];
+            if (child && typeof child === 'object' && !Array.isArray(child)) {
+              queue.push({ node: child, depth: cur.depth + 1 });
+            }
+          }
+        }
+        if (dataJson) known.__contextDataJson = safeClone(dataJson, 10) ?? null;
+      }
+    } catch {
+      /* 取不到就靠接口拦截 */
+    }
+
     const holders = [];
     document.querySelectorAll('[data-initial-data],[data-spm-anchor-id]').forEach((el) => {
       const value = el.getAttribute('data-initial-data');
@@ -204,6 +240,35 @@ async function grabPagePayload(page) {
     };
     collectDetail(document, 0);
 
+    // 主图视频：首图区渲染成 <video>，getLiveInfoByOfferIdWap 只返回「讲解视频」，
+    // 主图视频不在任何接口里，只能从 DOM 取。页面里是协议相对地址，补上 https。
+    const domVideos = [];
+    const seenVideo = new Set();
+    const collectVideo = (root, depth) => {
+      if (!root || depth > 8) return;
+      root.querySelectorAll('video').forEach((node) => {
+        const raw =
+          node.getAttribute('src') ||
+          node.currentSrc ||
+          node.querySelector('source')?.getAttribute('src') ||
+          '';
+        const url = raw.startsWith('//') ? `https:${raw}` : raw;
+        // blob:/data: 是 MSE 播放中的流，取不到原片
+        if (!/^https?:\/\//i.test(url)) return;
+        if (seenVideo.has(url)) return;
+        seenVideo.add(url);
+        const poster = node.getAttribute('poster') || '';
+        domVideos.push({
+          url,
+          poster: poster ? (poster.startsWith('//') ? `https:${poster}` : poster) : null
+        });
+      });
+      root.querySelectorAll('*').forEach((el) => {
+        if (el.shadowRoot) collectVideo(el.shadowRoot, depth + 1);
+      });
+    };
+    collectVideo(document, 0);
+
     const detailEl = document.querySelector(
       '#description, .desc-content, od-product-description, [class*="detail-content"]'
     );
@@ -218,6 +283,7 @@ async function grabPagePayload(page) {
       domShop,
       domDetailImages: detailImages.slice(0, 60),
       domDetailHtml: detailEl ? detailEl.innerHTML.slice(0, 200000) : '',
+      domVideos: domVideos.slice(0, 5),
       finalUrl: location.href,
       documentTitle: document.title,
       bodyText: (document.body?.innerText ?? '').slice(0, 20000)
